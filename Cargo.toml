@@ -1,0 +1,42 @@
+[package]
+name = "wom"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.5"
+clap = { version = "4.6.4", features = ["derive"] }
+crossterm = "0.29.0"
+directories = "6.0.0"
+ignore = "0.4.31"
+indicatif = "0.18.6"
+libc = "0.2.189"
+memmap2 = "0.9.11"
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+quick-xml = "0.41.0"
+ratatui = "0.30.2"
+rayon = "1.12.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
+toml = "1.1.3"
+ureq = "3.3.0"
+zip = "8.6.0"
+
+[features]
+default = []
+# GPU acceleration through ONNX Runtime's WebGPU execution provider, which uses
+# Dawn and can target Vulkan. This is the only usable GPU path for an AMD iGPU on
+# Linux: the ROCm EP needs a ROCm install, and DirectML is Windows-only.
+#
+# Off by default because it pulls a much larger prebuilt ORT (Dawn is linked in)
+# and, on an integrated GPU sharing system memory, is not reliably faster than the
+# CPU provider. Build with `--features gpu` and set `device = "auto"` to try it.
+gpu = ["ort/webgpu"]
+
+[profile.release]
+# Indexing is inference-bound and search is SIMD-bound; both want maximum
+# optimisation. Build time is a one-off cost we happily pay.
+lto = "fat"
+codegen-units = 1
