@@ -9,6 +9,7 @@ use crate::config::{Config, Profile};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use super::geo;
 
 /// Which extractor produced a body, recorded so `wom status` can report coverage
 /// and so a later run can retry files that were skipped for a fixable reason.
@@ -60,12 +61,19 @@ impl Capabilities {
 
     /// Human-readable summary for `wom index`, so a user who wonders why their
     /// PDFs are not searchable gets told rather than having to guess.
-    pub fn describe_gaps(&self) -> Vec<String> {
+    pub fn describe_gaps(&self, geo: bool) -> Vec<String> {
         let mut out = Vec::new();
         if !self.pdftotext {
             out.push(
                 "pdftotext not found: PDFs will be indexed by filename only \
                  (install poppler-utils)"
+                    .to_string(),
+            );
+        }
+        if geo && !self.exiftool {
+            out.push(
+                "extract.geo is on but exiftool was not found: GPS locations will \
+                 not be indexed (install libimage-exiftool-perl)"
                     .to_string(),
             );
         }
@@ -103,7 +111,7 @@ pub fn extract(path: &Path, profile: Profile, cfg: &Config, caps: &Capabilities)
         }
         _ if is_media_ext(&ext) => {
             if cfg.extract.media {
-                (Kind::Media, media_text(path, caps).unwrap_or_default())
+                (Kind::Media, media_text(path, caps, cfg.extract.geo).unwrap_or_default())
             } else {
                 (Kind::NameOnly, String::new())
             }
@@ -317,21 +325,57 @@ fn xml_text(xml: &str) -> String {
 
 // ------------------------------------------------------------------ media
 
-fn media_text(path: &Path, caps: &Capabilities) -> Option<String> {
-    if caps.exiftool {
-        let out = Command::new("exiftool")
-            .args(["-s", "-s", "-s", "-Title", "-Description", "-Keywords", "-Artist", "-Album"])
-            .arg(path)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        let s = String::from_utf8_lossy(&out.stdout).into_owned();
-        if !s.trim().is_empty() {
-            return Some(s);
+fn media_text(path: &Path, caps: &Capabilities, geo: bool) -> Option<String> {
+    if !caps.exiftool {
+        return None;
+    }
+    // Values only, in the order the tags were requested. GPS goes last so the
+    // signed-decimal pair (`-n`) lands at the end of the output, which is where
+    // parse_media_output looks for it.
+    let mut args = vec!["-s", "-s", "-s", "-Title", "-Description", "-Keywords", "-Artist", "-Album"];
+    if geo {
+        args.extend(["-n", "-GPSLatitude", "-GPSLongitude"]);
+    }
+    let out = Command::new("exiftool")
+        .args(&args)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    if s.trim().is_empty() {
+        return None;
+    }
+    if !geo {
+        return Some(s);
+    }
+    let (text, coords) = parse_media_output(&s);
+    match coords.and_then(|(lat, lon)| geo::nearest_place(lat, lon)) {
+        // The place goes first: body truncation keeps the head, and where a
+        // photo was taken is the most durable thing to say about it.
+        Some(place) => Some(format!("{place}\n{text}")),
+        None => Some(text),
+    }
+}
+
+/// Split exiftool's values-only output into metadata text and an optional GPS
+/// pair. With `-n`, coordinates print as signed decimals one per line, and the
+/// GPS tags were requested last — so two trailing in-range floats mean GPS
+/// data was present. Everything else stays text.
+fn parse_media_output(s: &str) -> (String, Option<(f64, f64)>) {
+    let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+    let n = lines.len();
+    if n >= 2 {
+        let lat = lines[n - 2].trim().parse::<f64>().ok();
+        let lon = lines[n - 1].trim().parse::<f64>().ok();
+        if let (Some(lat), Some(lon)) = (lat, lon) {
+            if (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) {
+                return (lines[..n - 2].join("\n"), Some((lat, lon)));
+            }
         }
     }
-    None
+    (s.to_string(), None)
 }
 
 // ------------------------------------------------------------------ names
@@ -667,5 +711,33 @@ mod tests {
         assert_eq!(content_hash("abc"), content_hash("abc"));
         assert_ne!(content_hash("abc"), content_hash("abd"));
         assert_eq!(content_hash("abc").len(), 16);
+    }
+
+    #[test]
+    fn media_output_parses_a_trailing_gps_pair() {
+        let (text, coords) = parse_media_output("Sunset over the old bridge\n43.8563\n18.4131");
+        assert_eq!(text, "Sunset over the old bridge");
+        let (lat, lon) = coords.expect("a lat/lon pair");
+        assert!((lat - 43.8563).abs() < 1e-9);
+        assert!((lon - 18.4131).abs() < 1e-9);
+        // ...and that pair is in fact Sarajevo; nearest_place agrees it is
+        // Bosnia, which is the whole point of the feature.
+        let place = geo::nearest_place(lat, lon).unwrap();
+        assert!(place.contains("Bosnia"), "got {place}");
+    }
+
+    #[test]
+    fn media_output_without_gps_stays_text() {
+        let (text, coords) = parse_media_output("A title\nSome keywords");
+        assert_eq!(text, "A title\nSome keywords");
+        assert!(coords.is_none());
+
+        // One float line is not a pair.
+        let (_, coords) = parse_media_output("43.8563");
+        assert!(coords.is_none());
+
+        // In-range-looking but out-of-range numbers are not coordinates.
+        let (_, coords) = parse_media_output("shot 2024\n120.5");
+        assert!(coords.is_none());
     }
 }

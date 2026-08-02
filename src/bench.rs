@@ -7,6 +7,7 @@
 use crate::config::{Config, Paths};
 use crate::db::Db;
 use crate::embed::{Embedder, onnx::OnnxEmbedder};
+use crate::rerank::Reranker;
 use crate::search::{self, Request};
 use anyhow::{Context, Result};
 use std::time::Instant;
@@ -152,6 +153,7 @@ pub fn measure_recall(
     cfg: &Config,
     db: &Db,
     embedder: &dyn Embedder,
+    reranker: Option<&dyn Reranker>,
     limit: usize,
 ) -> Result<RecallReport> {
     let mut hits = 0;
@@ -167,7 +169,7 @@ pub fn measure_recall(
             min_similarity: cfg.resolved_min_similarity(),
         };
         let t = Instant::now();
-        let results = search::search(paths, db, Some(embedder), &req)?;
+        let results = search::search(paths, db, Some(embedder), reranker, &req)?;
         timings.push(t.elapsed().as_secs_f64() * 1000.0);
 
         let found = results.iter().any(|r| {
@@ -197,6 +199,31 @@ pub fn measure_recall(
         misses,
         p50_ms: percentile(&timings, 0.50),
         p95_ms: percentile(&timings, 0.95),
+    })
+}
+
+/// Reranker load and scoring cost over a realistic candidate pool, so the
+/// price of `--rerank` is measured rather than guessed.
+pub struct RerankReport {
+    pub model_id: String,
+    pub load_secs: f64,
+    pub pairs: usize,
+    pub total_ms: f64,
+}
+
+pub fn measure_reranker(paths: &Paths, id: &str, pairs: usize) -> Result<RerankReport> {
+    let t0 = Instant::now();
+    let rr = crate::rerank::OnnxReranker::load(paths, id)?;
+    let load_secs = t0.elapsed().as_secs_f64();
+    let docs = sample_docs(pairs);
+    let t = Instant::now();
+    rr.score("tax forms from my employer", &docs)?;
+    let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+    Ok(RerankReport {
+        model_id: rr.model_id().to_string(),
+        load_secs,
+        pairs,
+        total_ms,
     })
 }
 

@@ -12,20 +12,16 @@ use tokenizers::Tokenizer;
 /// `ort::Error<R>` carries the partially-built object for recovery, which makes
 /// it neither `Send` nor `Sync`, so `anyhow::Context` cannot attach to it. Flatten
 /// it to a message instead.
-fn ort_ctx<T, E: Display>(r: std::result::Result<T, E>, what: &str) -> Result<T> {
+pub(crate) fn ort_ctx<T, E: Display>(r: std::result::Result<T, E>, what: &str) -> Result<T> {
     r.map_err(|e| anyhow!("{what}: {e}"))
 }
-
-/// Texts per session run. Large enough to keep every core busy, small enough that
-/// activations for the longest sequence stay modest.
-const MICRO_BATCH: usize = 32;
 
 /// Sequence lengths the model is ever asked for. Keeping this to a short ladder
 /// bounds the number of distinct tensor shapes ORT has to plan allocations for.
 const SEQ_BUCKETS: &[usize] = &[32, 64, 96, 128, 192, 256, 384, 512];
 
 /// Smallest bucket that fits `len`, never above `max_seq`.
-fn bucket_seq(len: usize, max_seq: usize) -> usize {
+pub(crate) fn bucket_seq(len: usize, max_seq: usize) -> usize {
     let cap = max_seq.max(1);
     for b in SEQ_BUCKETS {
         if *b >= len {
@@ -128,6 +124,67 @@ fn register_gpu(
     Ok(false)
 }
 
+/// Build an ORT session for a downloaded graph, with the two performance fixes
+/// this codebase measured: cache the optimised graph next to the model (a CLI
+/// starts fresh per invocation, and re-running the passes was ~250 ms of a
+/// 300 ms query), and disable the memory-pattern optimisation (sequence length
+/// varies per batch, so every new shape would otherwise pin another arena
+/// block — ~2.5 GB resident on a 274k-file index). Returns the session and
+/// whether a GPU provider was engaged.
+pub(crate) fn build_session(onnx: &std::path::Path, device: crate::config::Device) -> Result<(Session, bool)> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // Regenerate the cache if the source model is newer, so a re-downloaded or
+    // replaced model is never served from a stale optimised copy.
+    let optimised = onnx.with_extension("opt.onnx");
+    let use_cache = match (optimised.metadata(), onnx.metadata()) {
+        (Ok(c), Ok(m)) => match (c.modified(), m.modified()) {
+            (Ok(ct), Ok(mt)) => ct >= mt,
+            // Without usable timestamps, prefer correctness over speed.
+            _ => false,
+        },
+        _ => false,
+    };
+    let source: &std::path::Path = if use_cache { &optimised } else { onnx };
+
+    let builder = ort_ctx(Session::builder(), "creating ORT session builder")?;
+    let builder = ort_ctx(
+        builder.with_optimization_level(if use_cache {
+            // Already optimised; re-running the passes would cost the time
+            // this cache exists to save.
+            ort::session::builder::GraphOptimizationLevel::Disable
+        } else {
+            ort::session::builder::GraphOptimizationLevel::Level3
+        }),
+        "setting optimisation level",
+    )?;
+    let builder = if use_cache {
+        builder
+    } else {
+        ort_ctx(
+            builder.with_optimized_model_path(&optimised),
+            "setting the optimised-graph cache path",
+        )?
+    };
+    let builder = ort_ctx(
+        builder.with_intra_threads(threads),
+        "setting intra-op thread count",
+    )?;
+    let builder = ort_ctx(
+        builder.with_memory_pattern(false),
+        "disabling memory pattern optimisation",
+    )?;
+    let mut builder = builder;
+    let on_gpu = register_gpu(&mut builder, device)?;
+    let session = ort_ctx(
+        builder.commit_from_file(source),
+        &format!("loading ONNX graph {}", source.display()),
+    )?;
+    Ok((session, on_gpu))
+}
+
 impl OnnxEmbedder {
     /// Load `model_id`, honouring a device preference and downloading the model if
     /// this is its first use.
@@ -138,67 +195,7 @@ impl OnnxEmbedder {
         let tokenizer = Tokenizer::from_file(&files.tokenizer)
             .map_err(|e| anyhow!("loading tokenizer {}: {e}", files.tokenizer.display()))?;
 
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-
-        // Graph optimisation is redone on every process start, and `wom` is a CLI
-        // that starts fresh for each query — measured at ~250 ms of a 300 ms
-        // query. ORT can serialise the already-optimised graph, so do that once
-        // and load the result thereafter, which skips optimisation entirely.
-        let optimised = files.onnx.with_extension("opt.onnx");
-        // Regenerate if the source model is newer, so a re-downloaded or replaced
-        // model is never served from a stale optimised copy.
-        let use_cache = match (optimised.metadata(), files.onnx.metadata()) {
-            (Ok(c), Ok(m)) => match (c.modified(), m.modified()) {
-                (Ok(ct), Ok(mt)) => ct >= mt,
-                // Without usable timestamps, prefer correctness over speed.
-                _ => false,
-            },
-            _ => false,
-        };
-        let source = if use_cache { &optimised } else { &files.onnx };
-
-        let builder = ort_ctx(Session::builder(), "creating ORT session builder")?;
-        let builder = ort_ctx(
-            builder.with_optimization_level(if use_cache {
-                // Already optimised; re-running the passes would cost the time
-                // this cache exists to save.
-                ort::session::builder::GraphOptimizationLevel::Disable
-            } else {
-                ort::session::builder::GraphOptimizationLevel::Level3
-            }),
-            "setting optimisation level",
-        )?;
-        let builder = if use_cache {
-            builder
-        } else {
-            ort_ctx(
-                builder.with_optimized_model_path(&optimised),
-                "setting the optimised-graph cache path",
-            )?
-        };
-        let builder = ort_ctx(
-            builder.with_intra_threads(threads),
-            "setting intra-op thread count",
-        )?;
-        // ORT's memory-pattern optimisation pre-plans allocations from the shapes
-        // it has already seen, which pays off for a fixed input shape and works
-        // against us here: sequence length varies per batch, so every new shape
-        // adds another arena block that is never reused. Measured on a 274k-file
-        // index, leaving this on plateaued at ~2.5 GB resident on a machine with
-        // 3.2 GB free.
-        let builder = ort_ctx(
-            builder.with_memory_pattern(false),
-            "disabling memory pattern optimisation",
-        )?;
-        let mut builder = builder;
-        let on_gpu = register_gpu(&mut builder, device)?;
-        let session = ort_ctx(
-            builder.commit_from_file(source),
-            &format!("loading ONNX graph {}", source.display()),
-        )?;
-
+        let (session, on_gpu) = build_session(&files.onnx, device)?;
         let wants_token_type_ids = session.inputs().iter().any(|i| i.name() == "token_type_ids");
 
         Ok(Self {
@@ -241,7 +238,7 @@ impl OnnxEmbedder {
         order.sort_unstable_by_key(|i| encodings[*i].get_ids().len());
 
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); encodings.len()];
-        for group in order.chunks(MICRO_BATCH) {
+        for group in order.chunks(self.spec.micro_batch) {
             let refs: Vec<&tokenizers::Encoding> = group.iter().map(|i| &encodings[*i]).collect();
             let vecs = self.forward_group(&refs)?;
             for (slot, v) in group.iter().zip(vecs) {

@@ -75,6 +75,19 @@ pub struct SearchArgs {
     #[arg(long)]
     pub scores: bool,
 
+    /// Rerank the top candidates with a cross-encoder. Uses the configured
+    /// reranker, or the default when the config has it off.
+    #[arg(long)]
+    pub rerank: bool,
+
+    /// Rerank with a specific cross-encoder model (listed by `wom model list`).
+    #[arg(long, value_name = "MODEL")]
+    pub rerank_model: Option<String>,
+
+    /// Disable reranking even when the config enables it.
+    #[arg(long, conflicts_with = "rerank", conflicts_with = "rerank_model")]
+    pub no_rerank: bool,
+
     /// Override the dense-similarity floor for this query.
     #[arg(long, value_name = "COSINE")]
     pub min_similarity: Option<f32>,

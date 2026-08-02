@@ -7,6 +7,7 @@ mod config;
 mod db;
 mod embed;
 mod index;
+mod rerank;
 mod search;
 mod tui;
 mod vectors;
@@ -15,8 +16,10 @@ use anyhow::{Context, Result, bail};
 use cli::{Cli, Command, InitArgs, ModelAction};
 use config::{Config, Paths, Profile, Root, expand_path};
 use db::Db;
+use rerank::Reranker;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use vectors::VectorStore;
 
 fn main() {
     if let Err(e) = run() {
@@ -248,6 +251,23 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
         _ => Some(embed::onnx::OnnxEmbedder::load_on(paths, &cfg.model, cfg.device)?),
     };
 
+    // An interrupted scan leaves a good lexical index over an empty vector
+    // store, and hybrid search over it silently degrades to exact matching.
+    // Say so once, here, rather than inside the per-keystroke TUI refresh.
+    if let Some(e) = embedder.as_ref().map(|e| e as &dyn embed::Embedder) {
+        if let Some(gap) = search::dense_gap(paths, e) {
+            eprintln!("wom: {gap}; results are full-text only. Run `wom index --now`.");
+        }
+    }
+
+    // A reranker is loaded once per invocation, next to the embedder. Lexical
+    // mode is the no-model fast path and skips it there too.
+    let reranker = match (mode, effective_reranker(&cfg, &args)) {
+        (search::Mode::Lexical, _) => None,
+        (_, Some(id)) => Some(rerank::OnnxReranker::load(paths, &id)?),
+        (_, None) => None,
+    };
+
     let req = search::Request {
         text: query.text,
         scope: query.scope,
@@ -262,6 +282,7 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
         paths,
         &db,
         embedder.as_ref().map(|e| e as &dyn embed::Embedder),
+        reranker.as_ref().map(|r| r as &dyn rerank::Reranker),
         &req,
     )?;
 
@@ -280,6 +301,7 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
             paths,
             &db,
             embedder.as_ref().map(|e| e as &dyn embed::Embedder),
+            reranker.as_ref().map(|r| r as &dyn rerank::Reranker),
             &req,
             results,
         );
@@ -290,17 +312,37 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
     // and shell substitution both work.
     for r in &results {
         if args.scores {
-            // Show the cosine, which is interpretable, alongside the fused rank
-            // score, which is not.
-            match r.cosine {
-                Some(c) => println!("{:.4}  cos={c:.3}\t{}", r.score, r.display()),
-                None => println!("{:.4}  cos=-   \t{}", r.score, r.display()),
-            }
+            // Show the cosine and rerank logit, which are interpretable,
+            // alongside the fused rank score, which is not.
+            let cos = match r.cosine {
+                Some(c) => format!("cos={c:.3}"),
+                None => "cos=-    ".to_string(),
+            };
+            let rr = match r.rerank {
+                Some(s) => format!(" rr={s:+.2}"),
+                None => String::new(),
+            };
+            println!("{:.4}  {cos}{rr}\t{}", r.score, r.display());
         } else {
             println!("{}", r.display());
         }
     }
     Ok(())
+}
+
+/// Which reranker to load, if any. CLI beats config; `--rerank` with the
+/// config at "off" turns the default model on; "off" means none.
+fn effective_reranker(cfg: &Config, args: &cli::SearchArgs) -> Option<String> {
+    if args.no_rerank {
+        return None;
+    }
+    if let Some(m) = &args.rerank_model {
+        return Some(m.clone());
+    }
+    match cfg.reranker.as_str() {
+        "off" => args.rerank.then(|| rerank::DEFAULT_RERANKER.to_string()),
+        id => Some(id.to_string()),
+    }
 }
 
 /// Kick off a scheduled refresh in the background if one is due.
@@ -461,14 +503,19 @@ fn cmd_status(paths: &Paths, args: cli::StatusArgs) -> Result<()> {
     let db = Db::open(&db_path)?;
 
     let model = db.get_meta("model_id")?.unwrap_or_else(|| "-".into());
-    println!("model    {model}");
+    let dim = db.get_meta("dim")?.and_then(|d| d.parse::<usize>().ok());
+    match dim {
+        Some(d) => println!("model    {model} ({d}-dim)"),
+        None => println!("model    {model}"),
+    }
     if model != cfg.model && model != "-" {
         println!(
-            "         (config says {}; the index will be re-embedded on next scan)",
+            "         (config says {}; run `wom index --rebuild` to switch)",
             cfg.model
         );
     }
     println!("refresh  {:?}", cfg.refresh);
+    print_vectors_line(paths, &model, dim);
 
     let files = db.count_files()?;
     let embedded = db.count_embedded()?;
@@ -519,6 +566,38 @@ fn cmd_status(paths: &Paths, args: cli::StatusArgs) -> Result<()> {
     Ok(())
 }
 
+/// The `vectors  ...` status line: how many rows each store holds, with the
+/// remedy spelled out for the two gap cases. Never creates the files —
+/// `VectorStore::open` would, so existence is checked first.
+fn print_vectors_line(paths: &Paths, model: &str, dim: Option<usize>) {
+    match dim {
+        Some(d) if model != "-" => {
+            let files = vector_count(&paths.file_vectors(), d, model);
+            let dirs = vector_count(&paths.dir_vectors(), d, model);
+            println!("vectors  {files} file, {dirs} dir");
+            match files.as_str() {
+                "none" => println!("         (no vector index; run `wom index` to build it)"),
+                "0" => println!(
+                    "         (empty - indexing was likely interrupted; run `wom index --now`)"
+                ),
+                _ => {}
+            }
+        }
+        _ => println!("vectors  -"),
+    }
+}
+
+fn vector_count(path: &Path, dim: usize, model: &str) -> String {
+    if !path.exists() {
+        return "none".into();
+    }
+    match VectorStore::open(path, dim, model) {
+        Ok(s) => s.high_water().to_string(),
+        // A dim/model mismatch is already reported on the model line above.
+        Err(_) => "incompatible".into(),
+    }
+}
+
 fn cmd_config(paths: &Paths) -> Result<()> {
     let cfg = Config::load(paths)?;
     let p = paths.config_file();
@@ -537,12 +616,28 @@ fn cmd_model(paths: &Paths, action: ModelAction) -> Result<()> {
     match action {
         ModelAction::List => {
             let cfg = Config::load(paths)?;
+            // The model the current index was actually built with, if there is
+            // one — distinct from the configured model after `wom model set`
+            // and before the rebuild that makes them agree again.
+            let indexed = match paths.db_file().exists() {
+                true => Db::open(&paths.db_file())
+                    .and_then(|db| db.get_meta("model_id"))
+                    .ok()
+                    .flatten(),
+                false => None,
+            };
             println!(
                 "{:<26} {:>5} {:>7} {:>9}  {}",
                 "MODEL", "DIM", "SIZE", "POOLING", "NOTE"
             );
             for m in embed::REGISTRY {
-                let marker = if m.id == cfg.model { "*" } else { " " };
+                let marker = if m.id == cfg.model {
+                    "*"
+                } else if indexed.as_deref() == Some(m.id) {
+                    "i"
+                } else {
+                    " "
+                };
                 println!(
                     "{marker}{:<25} {:>5} {:>6}M {:>9}  {}",
                     m.id,
@@ -552,7 +647,15 @@ fn cmd_model(paths: &Paths, action: ModelAction) -> Result<()> {
                     m.note
                 );
             }
-            println!("\n* = configured. Switching models invalidates every stored vector.");
+            println!("\n* = configured, i = built the current index.");
+            println!("Switching models requires `wom index --rebuild`.");
+
+            println!("\n{:<42} {:>7}  {}", "RERANKER", "SIZE", "NOTE");
+            for m in rerank::RERANKER_REGISTRY {
+                let marker = if m.id == cfg.reranker { "*" } else { " " };
+                println!("{marker}{:<41} {:>6}M  {}", m.id, m.approx_mb, m.note);
+            }
+            println!("\n* = configured (\"off\" in config means none). Enable per query with --rerank.");
             Ok(())
         }
         ModelAction::Set { id } => {
@@ -566,8 +669,8 @@ fn cmd_model(paths: &Paths, action: ModelAction) -> Result<()> {
             cfg.save(paths)?;
             println!("Model: {old} -> {}", spec.id);
             println!(
-                "Vectors from the old model are not comparable, so the next `wom index`\n\
-                 will re-embed everything."
+                "Vectors from the old model are not comparable.\n\
+                 Run `wom index --rebuild` to re-embed everything."
             );
             Ok(())
         }
@@ -659,6 +762,20 @@ fn cmd_bench(paths: &Paths, args: cli::BenchArgs) -> Result<()> {
          easier to separate from noise. COSINES shows the pair it came from."
     );
 
+    // What `--rerank` costs on this machine: one load plus one committed-query
+    // pool of 80 pairs (the pool a default-limit search reranks).
+    if cfg.reranker != "off" {
+        let rep = bench::measure_reranker(paths, &cfg.reranker, 80)?;
+        println!(
+            "\nReranker {}: load {:.1}s, {} pairs in {:.0}ms ({:.1}ms/pair)",
+            rep.model_id,
+            rep.load_secs,
+            rep.pairs,
+            rep.total_ms,
+            rep.total_ms / rep.pairs as f64
+        );
+    }
+
     if let (Some(r), Ok(db)) = (reports.first(), Db::open(&paths.db_file())) {
         if r.model_id == cfg.model {
             db.set_meta(db::META_MODEL_RATE, &format!("{:.1}", r.docs_per_sec))
@@ -675,7 +792,22 @@ fn cmd_bench(paths: &Paths, args: cli::BenchArgs) -> Result<()> {
         }
         let db = Db::open(&db_path)?;
         let emb = embed::onnx::OnnxEmbedder::load_on(paths, &cfg.model, cfg.device)?;
-        let rep = bench::measure_recall(paths, &cfg, &db, &emb, cfg.limit)?;
+        // Recall is measured the way searches actually run, reranker included.
+        let rr = match cfg.reranker.as_str() {
+            "off" => None,
+            id => Some(rerank::OnnxReranker::load(paths, id)?),
+        };
+        if let Some(rr) = &rr {
+            println!("  (with {} reranking)", rr.model_id());
+        }
+        let rep = bench::measure_recall(
+            paths,
+            &cfg,
+            &db,
+            &emb,
+            rr.as_ref().map(|r| r as &dyn rerank::Reranker),
+            cfg.limit,
+        )?;
         println!(
             "  {}/{} golden queries found their expected answer",
             rep.hits, rep.total

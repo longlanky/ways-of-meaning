@@ -18,21 +18,39 @@ pub struct ModelFiles {
 
 /// Resolve `spec` to local files, downloading anything missing.
 pub fn ensure_model(paths: &Paths, spec: &ModelSpec) -> Result<ModelFiles> {
-    let dir = paths.model_dir(spec.id);
+    ensure_files(
+        paths,
+        spec.id,
+        spec.repo,
+        spec.onnx_path,
+        spec.tokenizer_path,
+        spec.approx_mb,
+    )
+}
+
+/// Resolve a (graph, tokenizer) pair from a Hugging Face repo to local files,
+/// downloading anything missing. Shared by embedding models and rerankers,
+/// which differ only in what runs the files.
+pub fn ensure_files(
+    paths: &Paths,
+    id: &str,
+    repo: &str,
+    onnx_path: &str,
+    tokenizer_path: &str,
+    approx_mb: u64,
+) -> Result<ModelFiles> {
+    let dir = paths.model_dir(id);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let onnx = dir.join("model.onnx");
     let tokenizer = dir.join("tokenizer.json");
 
     if !tokenizer.exists() {
-        fetch(&hf_url(spec.repo, spec.tokenizer_path), &tokenizer, "tokenizer")?;
+        fetch(&hf_url(repo, tokenizer_path), &tokenizer, "tokenizer")?;
     }
     if !onnx.exists() {
-        eprintln!(
-            "wom: fetching model {} (~{} MB) from {}",
-            spec.id, spec.approx_mb, spec.repo
-        );
-        fetch(&hf_url(spec.repo, spec.onnx_path), &onnx, "model.onnx")?;
+        eprintln!("wom: fetching model {id} (~{approx_mb} MB) from {repo}");
+        fetch(&hf_url(repo, onnx_path), &onnx, "model.onnx")?;
     }
 
     // A truncated download leaves a file that loads as a corrupt graph with an
@@ -41,9 +59,8 @@ pub fn ensure_model(paths: &Paths, spec: &ModelSpec) -> Result<ModelFiles> {
     if got < 1_000_000 {
         std::fs::remove_file(&onnx).ok();
         bail!(
-            "downloaded model for {} was only {got} bytes, which cannot be right; \
+            "downloaded model for {id} was only {got} bytes, which cannot be right; \
              removed it, please re-run",
-            spec.id
         );
     }
 
@@ -84,6 +101,7 @@ fn fetch(url: &str, dest: &Path, label: &str) -> Result<()> {
     bar.set_message(label.to_string());
 
     let tmp = dest.with_extension("part");
+    let mut written: u64 = 0;
     {
         let mut out = std::fs::File::create(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
@@ -96,11 +114,25 @@ fn fetch(url: &str, dest: &Path, label: &str) -> Result<()> {
             }
             out.write_all(&buf[..n])
                 .with_context(|| format!("writing {}", tmp.display()))?;
+            written += n as u64;
             bar.inc(n as u64);
         }
         out.flush()?;
     }
     bar.finish_and_clear();
+
+    // An early-EOF body can otherwise be renamed into place and fail later as
+    // an opaque "corrupt graph" on every run. When the server told us the size,
+    // hold it to its word.
+    if let Some(expected) = total {
+        if written != expected {
+            std::fs::remove_file(&tmp).ok();
+            bail!(
+                "download of {label} was truncated: got {written} of {expected} bytes; \
+                 removed the partial file, please re-run"
+            );
+        }
+    }
 
     std::fs::rename(&tmp, dest)
         .with_context(|| format!("renaming {} to {}", tmp.display(), dest.display()))?;

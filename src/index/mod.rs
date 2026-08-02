@@ -1,6 +1,7 @@
 //! Building and refreshing the index.
 
 pub mod extract;
+pub mod geo;
 pub mod walk;
 
 use crate::config::{Config, Paths, Profile, deepest_root};
@@ -106,8 +107,11 @@ pub fn scan(
 
     let db = Db::open(&paths.db_file())?;
     let caps = extract::Capabilities::detect();
-    for gap in caps.describe_gaps() {
+    for gap in caps.describe_gaps(cfg.extract.geo) {
         eprintln!("wom: {gap}");
+    }
+    if cfg.extract.geo && !cfg.extract.media {
+        eprintln!("wom: extract.geo is on but extract.media is off; no media is read, so no GPS data will be found");
     }
 
     let mut roots: Vec<&crate::config::Root> = match &opts.only_root {

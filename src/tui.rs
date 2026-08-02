@@ -4,6 +4,7 @@ use crate::actions;
 use crate::config::Paths;
 use crate::db::Db;
 use crate::embed::Embedder;
+use crate::rerank::Reranker;
 use crate::search::{self, Request, ResultKind, SearchResult};
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -35,6 +36,7 @@ pub struct App<'a> {
     paths: &'a Paths,
     db: &'a Db,
     embedder: Option<&'a dyn Embedder>,
+    reranker: Option<&'a dyn Reranker>,
 
     /// The resolved request, owned outright. Rebuilding it from `Config` on every
     /// refresh silently discarded the user's `-n`, `--min-similarity` and
@@ -56,6 +58,7 @@ impl<'a> App<'a> {
         paths: &'a Paths,
         db: &'a Db,
         embedder: Option<&'a dyn Embedder>,
+        reranker: Option<&'a dyn Reranker>,
         req: &Request,
         results: Vec<SearchResult>,
     ) -> Self {
@@ -67,6 +70,7 @@ impl<'a> App<'a> {
             paths,
             db,
             embedder,
+            reranker,
             req: req.clone(),
             results,
             state,
@@ -104,7 +108,10 @@ impl<'a> App<'a> {
     /// Re-run the search with the current query text, preserving every other
     /// parameter the user asked for.
     fn refresh(&mut self) {
-        match search::search(self.paths, self.db, self.embedder, &self.req) {
+        // Reranking costs tens of milliseconds: worth it on a committed query,
+        // not on every keystroke while the query is still being typed.
+        let rr = if self.editing { None } else { self.reranker };
+        match search::search(self.paths, self.db, self.embedder, rr, &self.req) {
             Ok(r) => {
                 self.results = r;
                 self.state
@@ -406,6 +413,12 @@ fn draw_results(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     },
                     Style::default().fg(Color::DarkGray),
                 ));
+                if let Some(rr) = r.rerank {
+                    spans.push(Span::styled(
+                        format!("rr{rr:+.1} "),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             }
             match r.kind {
                 ResultKind::Dir => {

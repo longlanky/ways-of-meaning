@@ -34,7 +34,7 @@ Optional external tools, detected at runtime and degraded gracefully if absent:
 | Tool | Gives you |
 |---|---|
 | `pdftotext` (poppler-utils) | PDF text. Without it, PDFs are found by filename only. |
-| `exiftool` | Image/audio/video metadata, when `extract.media = true`. |
+| `exiftool` | Image/audio/video metadata, when `extract.media = true`; GPS coordinates resolved to place names when `extract.geo = true`. |
 | `wl-clipboard` / `xclip` / `xsel` | The `y` (copy path) key in the browser. |
 
 Office formats (`.docx`, `.odt`, `.xlsx`, `.pptx`, …) need nothing extra — they
@@ -62,6 +62,7 @@ wom -i ~/projects sensors monitor   # same thing, unambiguously
 wom notes --lexical                 # full-text only, no model load (~5 ms)
 wom notes --dense                   # vector similarity only
 wom notes --scores                  # show fused score and cosine
+wom notes --rerank                  # cross-encoder second opinion on the top results
 ```
 
 A leading argument becomes a search scope only if it both exists as a directory
@@ -100,6 +101,16 @@ weak on proper nouns it never trained on; `wom bosnia` reaches
 `bosnia_croatia_trip_aug2024` through the lexical arm. RRF combines them without
 needing cosine and BM25 to be on a comparable scale.
 
+Optionally, a **cross-encoder reranker** gives the top fused candidates a second,
+more expensive opinion: the embedding model scores query and document separately,
+while the reranker reads the (query, document) pair together and is correspondingly
+more accurate. Off by default; enable per query with `--rerank`, or set
+`reranker = "ms-marco-MiniLM-L-6-v2-int8"` in the config (`--no-rerank` overrides).
+In the interactive browser it runs on the committed query only, never per
+keystroke. `wom model list` shows the registered rerankers, and `wom bench`
+measures what it costs on your machine — here, 80 pairs in ~0.7 s (~9 ms/pair),
+so a reranked query lands at ~1 s all-in against ~0.25 s without.
+
 Directories are searchable in their own right. A directory's vector blends its
 name with the centroid of its contents, weighted by how *coherent* those contents
 are (`‖mean‖` of the member unit vectors). Without that weighting, a directory
@@ -108,6 +119,17 @@ holding a bit of everything lands near the middle of embedding space and scores
 
 Vectors are int8-quantised in a flat mmap'd file and searched by brute force. No
 approximate index: no build step, no tuning, no staleness, and exact results.
+
+### Photo locations
+
+With `extract.media = true` and `extract.geo = true`, a photo's EXIF GPS
+coordinates are resolved to the nearest city and indexed as text — fully
+offline, using an embedded GeoNames extract (`data/cities.tsv`, CC-BY 4.0), so
+photo locations never leave the machine. `wom iceland` then finds the pictures
+you took near Akureyri even though the files are named `IMG_1399.jpg`.
+
+Already-indexed photos are skipped by change detection, so enabling geo on an
+existing index takes one `wom index --force` to re-read them.
 
 ## Measured on a real corpus
 
@@ -177,9 +199,77 @@ wom model self-test              # checks pooling and the query prefix
 wom bench --recall               # throughput and retrieval quality on your corpus
 ```
 
-Default is `bge-small-en-v1.5-int8`. `bge-base` and `bge-large` are available and
-substantially slower; `wom bench` will tell you what that costs on your machine
-rather than leaving you to guess.
+Default is `bge-small-en-v1.5-int8`. Larger and alternative families are
+registered — `bge-base`/`bge-large` (also int8), `mxbai-embed-large-v1` (also
+int8), `gte-large-en-v1.5` (also int8), and `all-MiniLM-L6-v2` — and `wom bench`
+will tell you what each costs on your machine rather than leaving you to guess.
+
+Measured here on the 8,029-file validation corpus (end-to-end indexing rate,
+single-query latency, the paraphrase-vs-unrelated cosine margin `wom model
+self-test` reports, and the golden retrieval set):
+
+| Model | docs/sec | Query | Margin | Recall |
+|---|---:|---:|---:|---:|
+| bge-small-en-v1.5-int8 | 58 | 4.9 ms | 0.34 | 6/6 |
+| bge-large-en-v1.5-int8 | 10 | 30 ms | 0.53 | 6/6 |
+| mxbai-embed-large-v1-int8 | 10 | 28 ms | 0.58 | 6/6 |
+| gte-large-en-v1.5-int8 | 1 | 592 ms | **0.09** | 4/6 |
+
+The large int8 models separate related from unrelated text noticeably better
+(margin 0.53–0.58 vs 0.34) at ~6x the indexing cost and ~5x the query latency —
+worth it if you search more than you index. mxbai has the widest margin.
+gte-large-en-v1.5 measured badly on this machine in every dimension — 60x
+slower than bge-small, a thin margin, and worse recall — so its similarity
+floor defaults to 0.80 and it stays registered only for completeness.
+
+### Which model should you use?
+
+| Tier | Model | Cost (this machine) | When |
+|---|---|---|---|
+| **Light** (default) | `bge-small-en-v1.5-int8` | 8k files in ~2 min; 274k in ~80 min; 5 ms queries | Daily driver; quality is already good |
+| **Medium** | `bge-base-en-v1.5` | ~3x light (estimated, not measured) | No compelling niche — skip to heavy if quality matters |
+| **Heavy** | `mxbai-embed-large-v1-int8` | 8k files in ~13 min; 274k in ~8 h; 28 ms queries | Best separation (margin 0.58); search more than you index |
+
+`bge-large-en-v1.5-int8` is the equally good heavy alternative (margin 0.53).
+The fp32 originals are ~2.5x slower with no measured benefit, and
+`gte-large-en-v1.5` is not recommended at any tier (see the table above).
+Switching takes two commands:
+
+```sh
+wom model set mxbai-embed-large-v1-int8
+wom index --rebuild   # required — vectors from different models are not comparable
+```
+
+### Rerankers
+
+A cross-encoder reranker re-orders the top fused candidates by reading each
+(query, document) pair together — more accurate than the embedding model's
+independent scores, at a measured ~9 ms per pair (~0.7 s for the 80-pair pool
+a default search reranks; a reranked query lands at ~1 s all-in vs ~0.25 s
+without). Off by default.
+
+```sh
+wom tax forms --rerank                          # one-off, with the default
+wom tax forms --rerank-model jina-reranker-v2-base-multilingual-int8
+wom tax forms --no-rerank                       # override the config for one query
+wom bench                                       # reports reranker load + pair cost
+```
+
+Or persist it in `config.toml`:
+
+```toml
+reranker = "ms-marco-MiniLM-L-6-v2-int8"   # or "off"
+```
+
+Two are registered (`wom model list` shows them):
+
+| Reranker | Size | Languages | Choose when |
+|---|---:|---|---|
+| `ms-marco-MiniLM-L-6-v2-int8` (default) | 22 MB | English | Everything English — tiny and fast |
+| `jina-reranker-v2-base-multilingual-int8` | 267 MB | Multilingual | You search content in languages other than English |
+
+(`bge-reranker-v2-m3` is deliberately absent: nobody publishes a single-file
+ONNX export of it, and the downloader fetches exactly two files per model.)
 
 Two details this implementation gets right that are easy to get wrong, because
 both fail *silently* — producing well-formed vectors and merely worse results:
@@ -263,6 +353,7 @@ profile = "code"
 
 [extract]
 media = false           # exiftool per media file; slow
+geo = false             # needs media = true; index photo GPS as place names
 max_file_size_mb = 20
 max_read_kb = 64
 pdf_pages = 5

@@ -233,6 +233,7 @@ mod tests {
             dense_rank: None,
             cosine: None,
             lexical_rank: None,
+            rerank: None,
             file_count: None,
         }
     }

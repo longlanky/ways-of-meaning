@@ -9,6 +9,7 @@
 use crate::config::Paths;
 use crate::db::{Db, NO_VEC, prefix_range};
 use crate::embed::Embedder;
+use crate::rerank::Reranker;
 use crate::vectors::VectorStore;
 use anyhow::{Context, Result};
 use rusqlite::params;
@@ -76,6 +77,9 @@ pub struct SearchResult {
     pub cosine: Option<f32>,
     /// 1-based rank in the lexical arm, if it appeared there.
     pub lexical_rank: Option<usize>,
+    /// Raw cross-encoder logit, when reranking ran. Only comparable within the
+    /// same reranker model.
+    pub rerank: Option<f32>,
     /// For a directory result, how many indexed files it holds. `None` for files.
     pub file_count: Option<i64>,
 }
@@ -109,6 +113,7 @@ pub fn search(
     paths: &Paths,
     db: &Db,
     embedder: Option<&dyn Embedder>,
+    reranker: Option<&dyn Reranker>,
     req: &Request,
 ) -> Result<Vec<SearchResult>> {
     if req.text.trim().is_empty() {
@@ -174,14 +179,31 @@ pub fn search(
         },
     ]);
 
-    // Resolve only what will be shown.
-    let keys = select(&fused, req.limit);
+    // A cross-encoder re-orders the top of the fused list — deeper than the
+    // final limit so it has room to promote candidates, capped so a committed
+    // query stays interactive. Lexical mode is the no-model fast path and
+    // skips it by design. The directory cap then runs on the new ordering.
+    let pool_size = (req.limit * 2).clamp(20, 100);
+    let reranked = match reranker {
+        Some(rr) if req.mode != Mode::Lexical && !fused.is_empty() => {
+            Some(rerank_pool(db, rr, &req.text, &fused, pool_size)?)
+        }
+        _ => None,
+    };
+    let keys = match &reranked {
+        Some((pool, _)) => select(pool, req.limit),
+        None => select(&fused, req.limit),
+    };
     let meta = load_meta(db, &keys)?;
 
     let dense_pos = ranks(&[&file_dense, &dir_dense]);
     let lex_pos = ranks(&[&file_lex, &dir_lex]);
 
     let scores: HashMap<Key, f32> = fused.into_iter().collect();
+    let rerank_scores: HashMap<Key, f32> = match reranked {
+        Some((_, map)) => map,
+        None => HashMap::new(),
+    };
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         let score = scores.get(&key).copied().unwrap_or(0.0);
@@ -198,6 +220,7 @@ pub fn search(
             dense_rank: dense_pos.get(&key).copied(),
             cosine: cosines.get(&key).copied(),
             lexical_rank: lex_pos.get(&key).copied(),
+            rerank: rerank_scores.get(&key).copied(),
             file_count: m.file_count,
         });
     }
@@ -247,6 +270,104 @@ fn ranks(lists: &[&[Key]]) -> HashMap<Key, usize> {
         .iter()
         .flat_map(|l| l.iter().enumerate().map(|(i, k)| (*k, i + 1)))
         .collect()
+}
+
+// ------------------------------------------------------------------ rerank
+
+/// Re-order the head of the fused list with a cross-encoder. Returns the pool
+/// (best first by rerank score) and the raw scores for display. Ties keep the
+/// fused order via the stable sort.
+fn rerank_pool(
+    db: &Db,
+    rr: &dyn Reranker,
+    query: &str,
+    fused: &[(Key, f32)],
+    size: usize,
+) -> Result<(Vec<(Key, f32)>, HashMap<Key, f32>)> {
+    let pool: Vec<Key> = fused.iter().take(size).map(|(k, _)| *k).collect();
+    let texts = rerank_texts(db, &pool)?;
+    let docs: Vec<String> = pool
+        .iter()
+        .map(|k| texts.get(k).cloned().unwrap_or_default())
+        .collect();
+    let scores = rr.score(query, &docs).context("reranking candidates")?;
+    if scores.len() != pool.len() {
+        anyhow::bail!(
+            "reranker returned {} scores for {} documents",
+            scores.len(),
+            pool.len()
+        );
+    }
+
+    let mut order: Vec<usize> = (0..pool.len()).collect();
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    let mut score_map = HashMap::with_capacity(pool.len());
+    let mut out = Vec::with_capacity(pool.len());
+    for i in order {
+        let key = pool[i];
+        score_map.insert(key, scores[i]);
+        out.push((key, scores[i]));
+    }
+    Ok((out, score_map))
+}
+
+/// The text a cross-encoder judges: filename plus the head of the extracted
+/// body for a file (bounded so a long document does not dominate the pair),
+/// the path for a directory, which has no body of its own.
+fn rerank_texts(db: &Db, keys: &[Key]) -> Result<HashMap<Key, String>> {
+    let mut out = HashMap::new();
+    for kind in [ResultKind::File, ResultKind::Dir] {
+        let ids: Vec<i64> = keys
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, id)| *id)
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        // A handful of ids, so an IN list of placeholders is fine — the same
+        // pattern as `load_meta`.
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = match kind {
+            // files_fts.rowid == files.id by construction.
+            ResultKind::File => format!(
+                "SELECT rowid, name, body FROM files_fts WHERE rowid IN ({placeholders})"
+            ),
+            // A directory has no body of its own; the placeholder third column
+            // keeps the row shape shared with the file query.
+            ResultKind::Dir => {
+                format!("SELECT id, path, '' FROM dirs WHERE id IN ({placeholders})")
+            }
+        };
+        let mut st = db.conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+        let rows = st.query_map(refs.as_slice(), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, col1, col2) = row?;
+            let text = match kind {
+                ResultKind::File => {
+                    let body = col2.unwrap_or_default();
+                    let head = match body.char_indices().nth(2000) {
+                        Some((i, _)) => &body[..i],
+                        None => body.as_str(),
+                    };
+                    format!("{col1}\n{head}")
+                }
+                ResultKind::Dir => col1,
+            };
+            out.insert((kind, id), text);
+        }
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------------------------ dense
@@ -304,6 +425,33 @@ fn dense_arm(
         .filter(|h| h.score >= req.min_similarity)
         .map(|h| (h.row as i64, h.score))
         .collect())
+}
+
+/// Why a hybrid search would silently return full-text-only results, or `None`
+/// when the vector index is present and populated.
+///
+/// `write_batch` commits the full-text rows before embedding runs, so a scan
+/// that dies midway leaves a fully searchable lexical index over an empty
+/// vector store — and every later hybrid search quietly degrades to exact
+/// matching. That is worth one warning per CLI invocation. Only the file store
+/// is checked: it is written first, so it is the earliest place the gap shows.
+pub fn dense_gap(paths: &Paths, embedder: &dyn Embedder) -> Option<String> {
+    store_gap(&paths.file_vectors(), embedder.dim(), embedder.model_id())
+}
+
+fn store_gap(vec_path: &Path, dim: usize, model_id: &str) -> Option<String> {
+    if !vec_path.exists() {
+        return Some("no vector index found".to_string());
+    }
+    // Open errors (a model swap, a truncated file) are *not* reported here: the
+    // dense arm itself fails loudly with the real cause. This check exists only
+    // for the silent cases.
+    match VectorStore::open(vec_path, dim, model_id) {
+        Ok(store) if store.high_water() == 0 => {
+            Some("the vector index is empty (indexing was likely interrupted)".to_string())
+        }
+        _ => None,
+    }
 }
 
 /// A per-row boolean mask of vector rows that lie under one of the scope paths.
@@ -754,6 +902,7 @@ mod tests {
             dense_rank: None,
             cosine: None,
             lexical_rank: None,
+            rerank: None,
             file_count: None,
         };
         assert_eq!(d.display(), "directory:/h/employment_docs");
@@ -772,5 +921,157 @@ mod tests {
         unsafe { std::env::set_var("HOME", "/home/tester") };
         assert_eq!(tilde(Path::new("/home/tester/Documents/a")), "~/Documents/a");
         assert_eq!(tilde(Path::new("/etc/passwd")), "/etc/passwd");
+    }
+
+    #[test]
+    fn store_gap_flags_only_missing_and_empty_stores() {
+        let p = std::env::temp_dir().join("wom-search-gap-test.i8");
+        std::fs::remove_file(&p).ok();
+
+        assert!(
+            store_gap(&p, 4, "test-model").is_some(),
+            "a missing store must be flagged"
+        );
+
+        let mut store = VectorStore::open(&p, 4, "test-model").unwrap();
+        let gap = store_gap(&p, 4, "test-model").unwrap();
+        assert!(gap.contains("empty"), "a fresh store is empty, got: {gap}");
+
+        store.put(0, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(
+            store_gap(&p, 4, "test-model").is_none(),
+            "a populated store must not be flagged"
+        );
+
+        // A model mismatch is the dense arm's loud error, not this check's
+        // concern — the silent-path detector stays out of it.
+        assert!(store_gap(&p, 4, "other-model").is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ------------------------------------------------------------ rerank
+
+    use crate::rerank::test_support::MockReranker;
+    use rusqlite::params;
+
+    fn insert_file(db: &Db, path: &str, body: &str) -> i64 {
+        db.conn
+            .execute(
+                "INSERT INTO files(path, mtime_ns, size, seen_scan) VALUES (?1, 1, 1, 1)",
+                params![path],
+            )
+            .unwrap();
+        let id = db.conn.last_insert_rowid();
+        let name = Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        db.put_fts(id, path, &name, body).unwrap();
+        id
+    }
+
+    fn insert_dir(db: &Db, path: &str) -> i64 {
+        db.conn
+            .execute("INSERT INTO dirs(path) VALUES (?1)", params![path])
+            .unwrap();
+        let id = db.conn.last_insert_rowid();
+        let name = Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        db.put_dir_fts(id, path, &name).unwrap();
+        id
+    }
+
+    fn hybrid_req(text: &str) -> Request {
+        Request {
+            text: text.to_string(),
+            scope: Vec::new(),
+            limit: 10,
+            mode: Mode::Hybrid,
+            min_similarity: 0.0,
+        }
+    }
+
+    #[test]
+    fn reranker_reorders_fused_results() {
+        let db = Db::open_in_memory().unwrap();
+        // `a` repeats the query term, so BM25 favours it; the reranker favours
+        // `b` by name. The reranker's say is final.
+        insert_file(&db, "/t/plain_report.txt", "earnings earnings earnings summary");
+        insert_file(&db, "/t/tax_return_2024.txt", "earnings");
+        let rr = MockReranker { hot: "tax_return" };
+
+        let out = search(
+            &Paths::for_test(),
+            &db,
+            None,
+            Some(&rr),
+            &hybrid_req("earnings"),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2, "both files match lexically");
+        assert_eq!(out[0].path.to_string_lossy(), "/t/tax_return_2024.txt");
+        assert!(
+            out[0].rerank.unwrap() > out[1].rerank.unwrap(),
+            "raw rerank scores are carried for display"
+        );
+    }
+
+    #[test]
+    fn reranker_sees_directories_by_path() {
+        let db = Db::open_in_memory().unwrap();
+        insert_file(&db, "/t/tax_guide.txt", "tax filing instructions");
+        insert_dir(&db, "/t/tax_stuff");
+        let rr = MockReranker { hot: "tax_stuff" };
+
+        let out = search(&Paths::for_test(), &db, None, Some(&rr), &hybrid_req("tax"))
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].kind, ResultKind::Dir, "reranker promoted the directory");
+    }
+
+    #[test]
+    fn lexical_mode_skips_the_reranker() {
+        let db = Db::open_in_memory().unwrap();
+        insert_file(&db, "/t/tax_return_2024.txt", "earnings");
+        insert_file(&db, "/t/plain_report.txt", "earnings report");
+        let rr = MockReranker { hot: "tax_return" };
+        let req = Request {
+            mode: Mode::Lexical,
+            ..hybrid_req("earnings")
+        };
+
+        let out = search(&Paths::for_test(), &db, None, Some(&rr), &req).unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter().all(|r| r.rerank.is_none()),
+            "lexical mode is the no-model fast path"
+        );
+    }
+
+    #[test]
+    fn directory_cap_still_applies_after_reranking() {
+        let db = Db::open_in_memory().unwrap();
+        // Four dirs the reranker loves and one file it hates. Without the cap
+        // the file would be squeezed out entirely; with it, one dir passes the
+        // gate, the file takes its slot, and the remainder backfills.
+        for d in ["d1", "d2", "d3", "d4"] {
+            insert_dir(&db, &format!("/t/tax_{d}"));
+        }
+        insert_file(&db, "/t/tax_notes.txt", "tax");
+        let rr = MockReranker { hot: "tax_d" };
+        let req = Request {
+            limit: 4,
+            ..hybrid_req("tax")
+        };
+
+        let out = search(&Paths::for_test(), &db, None, Some(&rr), &req).unwrap();
+        let dirs = out.iter().filter(|r| r.kind == ResultKind::Dir).count();
+        assert_eq!(dirs, 3, "one through the cap, two backfilled, got {dirs}");
+        assert!(
+            out.iter().any(|r| r.kind == ResultKind::File),
+            "the lone file must survive the reranked dir sweep"
+        );
     }
 }

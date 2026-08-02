@@ -108,6 +108,10 @@ pub struct ExtractConfig {
     /// Run exiftool/ffprobe over images, audio and video. Off by default: it
     /// spawns a process per file, which dominates walk time on a Pictures dir.
     pub media: bool,
+    /// Reverse-geocode EXIF GPS coordinates to the nearest city and index the
+    /// place name, so `wom bosnia` finds photos taken there. Requires
+    /// `media = true`; fully offline (embedded GeoNames extract).
+    pub geo: bool,
     /// Largest file we will open for extraction.
     pub max_file_size_mb: u64,
     /// Bytes of a text file read before truncating.
@@ -120,6 +124,7 @@ impl Default for ExtractConfig {
     fn default() -> Self {
         Self {
             media: false,
+            geo: false,
             max_file_size_mb: 20,
             max_read_kb: 64,
             pdf_pages: 5,
@@ -169,6 +174,10 @@ pub struct Config {
     /// the model spaces related from unrelated text — the same reason pooling and
     /// the query prefix live in the registry.
     pub min_similarity: Option<f32>,
+    /// Cross-encoder that re-orders the top fused candidates, or "off". Ids are
+    /// in `rerank::RERANKER_REGISTRY`; `--rerank` / `--no-rerank` override per
+    /// query.
+    pub reranker: String,
     pub roots: Vec<Root>,
     pub extract: ExtractConfig,
     pub ignore: IgnoreConfig,
@@ -182,6 +191,7 @@ impl Default for Config {
             refresh: Refresh::Daily,
             limit: 40,
             min_similarity: None,
+            reranker: "off".to_string(),
             roots: Vec::new(),
             extract: ExtractConfig::default(),
             ignore: IgnoreConfig::default(),
@@ -269,6 +279,17 @@ impl Paths {
             config_dir: dirs.config_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),
         })
+    }
+
+    /// A `Paths` that points nowhere in particular, for tests whose code path
+    /// never touches the filesystem (searching with no embedder, say). Lets
+    /// tests avoid the `WOM_HOME` env var, which races under a parallel harness.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            config_dir: PathBuf::from("/nonexistent"),
+            data_dir: PathBuf::from("/nonexistent"),
+        }
     }
 
     pub fn data_dir(&self) -> &Path {

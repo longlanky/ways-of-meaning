@@ -33,6 +33,11 @@ pub enum Pooling {
     Mean,
 }
 
+/// Texts per session run when none is specified. Large enough to keep every
+/// core busy, small enough that activations for the longest sequence stay
+/// modest. Large fp32 models need less: see `ModelSpec::micro_batch`.
+pub const DEFAULT_MICRO_BATCH: usize = 32;
+
 /// A model we know how to fetch and run.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpec {
@@ -51,6 +56,14 @@ pub struct ModelSpec {
     pub query_prefix: &'static str,
     /// Approximate download size, for the progress bar and for `wom model list`.
     pub approx_mb: u64,
+    /// Texts per ONNX session run. Bounds peak memory: one micro-batch's
+    /// activations scale with batch × seq × hidden, and for a 1024-dim fp32
+    /// model at seq 512 a batch of 32 needs ~1 GB of transient space on top of
+    /// the graph itself — too much on a machine with ~3 GB free, which is how
+    /// an interrupted scan leaves an empty vector store behind (see
+    /// `search::dense_gap`). Small models keep the default; large fp32 ones
+    /// trade a little throughput for staying within the machine's budget.
+    pub micro_batch: usize,
     /// Starting estimate of end-to-end indexing throughput, used by `wom init`
     /// before anything has been measured. This is whole-scan throughput including
     /// extraction and database writes, not raw model throughput, because that is
@@ -86,6 +99,7 @@ pub const REGISTRY: &[ModelSpec] = &[
         pooling: Pooling::Cls,
         query_prefix: BGE_QUERY_PREFIX,
         approx_mb: 33,
+        micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 60,
         default_min_similarity: 0.55,
         note: "default; measured 1.4x faster than fp32 on this CPU",
@@ -100,6 +114,7 @@ pub const REGISTRY: &[ModelSpec] = &[
         pooling: Pooling::Cls,
         query_prefix: BGE_QUERY_PREFIX,
         approx_mb: 127,
+        micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 43,
         default_min_similarity: 0.55,
         note: "fp32 baseline for measuring quantisation loss",
@@ -114,6 +129,7 @@ pub const REGISTRY: &[ModelSpec] = &[
         pooling: Pooling::Cls,
         query_prefix: BGE_QUERY_PREFIX,
         approx_mb: 416,
+        micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 16,
         default_min_similarity: 0.55,
         note: "middle ground; ~3x the indexing cost of bge-small",
@@ -128,9 +144,109 @@ pub const REGISTRY: &[ModelSpec] = &[
         pooling: Pooling::Cls,
         query_prefix: BGE_QUERY_PREFIX,
         approx_mb: 1275,
+        // A 1.3 GB fp32 graph plus 32×512×1024 activations overruns the ~3 GB
+        // this machine typically has free; 8 keeps peak RSS within budget.
+        micro_batch: 8,
         rough_docs_per_sec: 5,
         default_min_similarity: 0.55,
-        note: "highest MTEB score; ~10x the indexing cost of bge-small",
+        note: "highest MTEB score of the BGE family; ~10x the indexing cost of bge-small",
+    },
+    ModelSpec {
+        id: "bge-large-en-v1.5-int8",
+        repo: "Xenova/bge-large-en-v1.5",
+        onnx_path: "onnx/model_int8.onnx",
+        tokenizer_path: "tokenizer.json",
+        dim: 1024,
+        max_seq: 512,
+        pooling: Pooling::Cls,
+        query_prefix: BGE_QUERY_PREFIX,
+        approx_mb: 320,
+        // int8 weights shrink the graph 4x; a mid-size batch now fits the
+        // machine's memory budget comfortably.
+        micro_batch: 16,
+        // Measured end-to-end on the 8k-file validation corpus: 10 docs/sec,
+        // 6/6 golden recall, 1.7 GB peak RSS.
+        rough_docs_per_sec: 10,
+        default_min_similarity: 0.55,
+        note: "bge-large quality at ~2.5x its fp32 indexing speed; the practical large model",
+    },
+    ModelSpec {
+        id: "mxbai-embed-large-v1",
+        repo: "mixedbread-ai/mxbai-embed-large-v1",
+        onnx_path: "onnx/model.onnx",
+        tokenizer_path: "tokenizer.json",
+        dim: 1024,
+        max_seq: 512,
+        // CLS pooling and the BGE retrieval prefix are from the model card and
+        // its 1_Pooling/config.json — verified, not assumed.
+        pooling: Pooling::Cls,
+        query_prefix: BGE_QUERY_PREFIX,
+        approx_mb: 1275,
+        micro_batch: 8,
+        rough_docs_per_sec: 5,
+        default_min_similarity: 0.55,
+        note: "top-tier MTEB retrieval; same size class as bge-large",
+    },
+    ModelSpec {
+        id: "mxbai-embed-large-v1-int8",
+        repo: "mixedbread-ai/mxbai-embed-large-v1",
+        onnx_path: "onnx/model_quantized.onnx",
+        tokenizer_path: "tokenizer.json",
+        dim: 1024,
+        max_seq: 512,
+        pooling: Pooling::Cls,
+        query_prefix: BGE_QUERY_PREFIX,
+        approx_mb: 321,
+        micro_batch: 16,
+        // Measured end-to-end: 10 docs/sec, 6/6 golden recall, widest margin
+        // of any registered model (0.58).
+        rough_docs_per_sec: 10,
+        default_min_similarity: 0.55,
+        note: "quantised official export; widest measured relevance margin",
+    },
+    ModelSpec {
+        id: "gte-large-en-v1.5",
+        repo: "Alibaba-NLP/gte-large-en-v1.5",
+        onnx_path: "onnx/model.onnx",
+        tokenizer_path: "tokenizer.json",
+        dim: 1024,
+        // The model's real positional limit is 8192, but documents are embedded
+        // from their head (~256 tokens) and 512 keeps the memory math identical
+        // to the other large models.
+        max_seq: 512,
+        // CLS pooling per its 1_Pooling/config.json; symmetric — no query prefix.
+        pooling: Pooling::Cls,
+        query_prefix: "",
+        approx_mb: 1665,
+        micro_batch: 8,
+        // The int8 export measured 1 doc/sec end-to-end and a 0.09 margin here
+        // (see its note); the fp32 original will be slower still.
+        rough_docs_per_sec: 1,
+        // Measured on this machine: paraphrase 0.85 vs unrelated 0.76 — a thin
+        // gap, so the floor sits far higher than the BGE models'. Ranking is
+        // unaffected; only the noise cut-off moves.
+        default_min_similarity: 0.80,
+        note: "Alibaba's large retriever; measured slow here — see int8 entry",
+    },
+    ModelSpec {
+        id: "gte-large-en-v1.5-int8",
+        repo: "Alibaba-NLP/gte-large-en-v1.5",
+        onnx_path: "onnx/model_int8.onnx",
+        tokenizer_path: "tokenizer.json",
+        dim: 1024,
+        max_seq: 512,
+        pooling: Pooling::Cls,
+        query_prefix: "",
+        approx_mb: 425,
+        micro_batch: 16,
+        // See the fp32 entry: measured unrelated cosine 0.76, so the floor
+        // must sit above it.
+        default_min_similarity: 0.80,
+        // Measured on this machine (Ryzen 7 PRO 6850U): 1 doc/sec end-to-end
+        // and 590 ms per query — 60x slower than bge-small with no quality
+        // gain to show for it. Kept for completeness, not recommended.
+        rough_docs_per_sec: 1,
+        note: "measured 1 doc/sec, 590ms queries, thin margin; not recommended",
     },
     ModelSpec {
         id: "all-MiniLM-L6-v2",
@@ -142,6 +258,7 @@ pub const REGISTRY: &[ModelSpec] = &[
         pooling: Pooling::Mean,
         query_prefix: "",
         approx_mb: 90,
+        micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 75,
         default_min_similarity: 0.55,
         note: "the spec's fallback; mean pooling, no query prefix",
@@ -218,6 +335,37 @@ mod tests {
         for m in REGISTRY.iter().filter(|m| m.id.starts_with("bge-")) {
             assert_eq!(m.pooling, Pooling::Cls, "{} pooling", m.id);
             assert_eq!(m.query_prefix, BGE_QUERY_PREFIX, "{} prefix", m.id);
+        }
+    }
+
+    #[test]
+    fn mxbai_uses_cls_pooling_and_the_bge_prefix() {
+        // Verified against its 1_Pooling/config.json and model card.
+        for m in REGISTRY.iter().filter(|m| m.id.starts_with("mxbai-")) {
+            assert_eq!(m.pooling, Pooling::Cls, "{} pooling", m.id);
+            assert_eq!(m.query_prefix, BGE_QUERY_PREFIX, "{} prefix", m.id);
+        }
+    }
+
+    #[test]
+    fn gte_uses_cls_pooling_and_no_prefix() {
+        // Verified against its 1_Pooling/config.json; GTE v1.5 is symmetric.
+        for m in REGISTRY.iter().filter(|m| m.id.starts_with("gte-")) {
+            assert_eq!(m.pooling, Pooling::Cls, "{} pooling", m.id);
+            assert!(m.query_prefix.is_empty(), "{} prefix", m.id);
+        }
+    }
+
+    #[test]
+    fn large_fp32_models_use_a_smaller_micro_batch() {
+        // The memory guard: a 1024-dim fp32 model at the default batch size
+        // overruns the ~3 GB free this machine typically has.
+        for m in REGISTRY.iter().filter(|m| m.dim >= 1024 && m.approx_mb > 1000) {
+            assert!(
+                m.micro_batch < DEFAULT_MICRO_BATCH,
+                "{} must not micro-batch at the default",
+                m.id
+            );
         }
     }
 
