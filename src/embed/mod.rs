@@ -48,6 +48,12 @@ pub struct ModelSpec {
     pub onnx_path: &'static str,
     /// Path of the tokenizer JSON within the repo.
     pub tokenizer_path: &'static str,
+    /// Pinned blake3 hex of the ONNX graph / tokenizer, when known.
+    /// `None` means trust-on-first-use (warned in `wom model list`); once
+    /// populated via `b3sum`, `ensure_files` enforces the pin and re-downloads
+    /// on mismatch instead of running a substituted graph.
+    pub onnx_hash: Option<&'static str>,
+    pub tokenizer_hash: Option<&'static str>,
     pub dim: usize,
     /// Positional-embedding limit of the model; inputs are truncated to it.
     pub max_seq: usize,
@@ -102,6 +108,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 60,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "default; measured 1.4x faster than fp32 on this CPU",
     },
     ModelSpec {
@@ -117,6 +125,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 43,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "fp32 baseline for measuring quantisation loss",
     },
     ModelSpec {
@@ -132,6 +142,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 16,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "middle ground; ~3x the indexing cost of bge-small",
     },
     ModelSpec {
@@ -149,6 +161,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         micro_batch: 8,
         rough_docs_per_sec: 5,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "highest MTEB score of the BGE family; ~10x the indexing cost of bge-small",
     },
     ModelSpec {
@@ -168,6 +182,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         // 6/6 golden recall, 1.7 GB peak RSS.
         rough_docs_per_sec: 10,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "bge-large quality at ~2.5x its fp32 indexing speed; the practical large model",
     },
     ModelSpec {
@@ -185,6 +201,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         micro_batch: 8,
         rough_docs_per_sec: 5,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "top-tier MTEB retrieval; same size class as bge-large",
     },
     ModelSpec {
@@ -202,6 +220,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         // of any registered model (0.58).
         rough_docs_per_sec: 10,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "quantised official export; widest measured relevance margin",
     },
     ModelSpec {
@@ -226,6 +246,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         // gap, so the floor sits far higher than the BGE models'. Ranking is
         // unaffected; only the noise cut-off moves.
         default_min_similarity: 0.80,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "Alibaba's large retriever; measured slow here — see int8 entry",
     },
     ModelSpec {
@@ -242,6 +264,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         // See the fp32 entry: measured unrelated cosine 0.76, so the floor
         // must sit above it.
         default_min_similarity: 0.80,
+        onnx_hash: None,
+        tokenizer_hash: None,
         // Measured on this machine (Ryzen 7 PRO 6850U): 1 doc/sec end-to-end
         // and 590 ms per query — 60x slower than bge-small with no quality
         // gain to show for it. Kept for completeness, not recommended.
@@ -261,6 +285,8 @@ pub const REGISTRY: &[ModelSpec] = &[
         micro_batch: DEFAULT_MICRO_BATCH,
         rough_docs_per_sec: 75,
         default_min_similarity: 0.55,
+        onnx_hash: None,
+        tokenizer_hash: None,
         note: "the spec's fallback; mean pooling, no query prefix",
     },
 ];

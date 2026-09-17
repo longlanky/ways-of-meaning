@@ -171,14 +171,10 @@ fn lexical_search_works_without_a_model() {
     let (_, err, ok) = h.run(&["init", "--add", &corpus, "--yes"]);
     assert!(ok, "init failed: {err}");
 
-    // `--no-embed` is not a flag; a dry run cannot populate. Index with the model
-    // only when available, otherwise this test still covers the lexical path
-    // because the full-text index is built regardless of the model.
-    if !model_available() {
-        return;
-    }
-    let (_, err, ok) = h.run(&["index"]);
-    assert!(ok, "index failed: {err}");
+    // Model-free fast path: builds SQLite+FTS only, never downloads a model.
+    // This test always runs, even under WOM_SKIP_MODEL=1.
+    let (_, err, ok) = h.run(&["index", "--no-embed", "--now"]);
+    assert!(ok, "index --no-embed failed: {err}");
 
     // Directly from the spec's second example.
     let results = h.search(&["--lexical", "bosnia", "--no-tui"]);
@@ -190,14 +186,29 @@ fn lexical_search_works_without_a_model() {
 }
 
 #[test]
+fn no_embed_index_reports_zero_embedded_and_stays_lexically_searchable() {
+    // Cheap regression for the `--no-embed` flag itself: metadata + FTS land,
+    // vectors do not, and `--lexical` still answers.
+    let h = Harness::new("noembed");
+    let corpus = h.corpus.to_string_lossy().into_owned();
+    h.run(&["init", "--add", &corpus, "--yes"]);
+    let (out, err, ok) = h.run(&["index", "--no-embed", "--now"]);
+    assert!(ok, "index --no-embed failed: {err}");
+    assert!(
+        out.contains("0 embedded") || out.contains("embedded"),
+        "expected embedded count in output, got: {out}"
+    );
+    let results = h.search(&["--lexical", "sourdough", "--no-tui"]);
+    assert_contains(&results, "sourdough", "lexical after --no-embed");
+}
+
+#[test]
 fn ignore_rules_keep_build_artefacts_out_of_the_index() {
-    if !model_available() {
-        return;
-    }
     let h = Harness::new("ignores");
     let corpus = h.corpus.to_string_lossy().into_owned();
     h.run(&["init", "--add", &corpus, "--yes"]);
-    let (_, err, ok) = h.run(&["index"]);
+    // Lexical-only index suffices: ignore rules act at walk time.
+    let (_, err, ok) = h.run(&["index", "--no-embed", "--now"]);
     assert!(ok, "index failed: {err}");
 
     // A query that would match the excluded files if they had been indexed.

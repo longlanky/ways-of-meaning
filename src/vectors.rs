@@ -241,6 +241,16 @@ impl VectorStore {
                 self.dim
             );
         }
+        if let Some(a) = allow {
+            if a.len() < self.high_water {
+                bail!(
+                    "scope allow-list has {} entries but the vector store holds {}; \
+                     refusing to silently exclude rows",
+                    a.len(),
+                    self.high_water
+                );
+            }
+        }
         if k == 0 || self.high_water == 0 {
             return Ok(Vec::new());
         }

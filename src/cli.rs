@@ -137,6 +137,12 @@ pub struct IndexArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Index metadata and full text only, without loading the embedding model.
+    /// The fast path for `--lexical` search and for machines that have not
+    /// downloaded a model yet; a later `wom index --now` backfills vectors.
+    #[arg(long)]
+    pub no_embed: bool,
+
     /// Limit to one configured root.
     #[arg(long = "root", value_name = "DIR")]
     pub root: Option<String>,

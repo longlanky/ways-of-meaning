@@ -183,6 +183,8 @@ pub fn search(
     // final limit so it has room to promote candidates, capped so a committed
     // query stays interactive. Lexical mode is the no-model fast path and
     // skips it by design. The directory cap then runs on the new ordering.
+    // When limit > pool cap, the reranked head is followed by the fused tail
+    // in fused order, so a large `--limit` never silently truncates.
     let pool_size = (req.limit * 2).clamp(20, 100);
     let reranked = match reranker {
         Some(rr) if req.mode != Mode::Lexical && !fused.is_empty() => {
@@ -191,7 +193,27 @@ pub fn search(
         _ => None,
     };
     let keys = match &reranked {
-        Some((pool, _)) => select(pool, req.limit),
+        Some((pool, _)) => {
+            let mut head = select(pool, req.limit);
+            if head.len() < req.limit && fused.len() > pool.len() {
+                let seen: HashSet<Key> = head.iter().copied().collect();
+                let mut tail: Vec<(Key, f32)> = fused[pool.len()..]
+                    .iter()
+                    .filter(|(k, _)| !seen.contains(k))
+                    .copied()
+                    .collect();
+                // Reuse the directory cap over head+tail in fused order is
+                // complex; simplest correct: fill remaining slots with tail in
+                // fused order (dirs already capped in head).
+                for (k, _) in tail.drain(..) {
+                    if head.len() >= req.limit {
+                        break;
+                    }
+                    head.push(k);
+                }
+            }
+            head
+        }
         None => select(&fused, req.limit),
     };
     let meta = load_meta(db, &keys)?;
@@ -544,23 +566,29 @@ fn lexical_arm(
             if i > 0 {
                 sql.push_str(" OR ");
             }
-            // Parameters start at 2; two per scope entry.
+            // Parameters start at 2; three per scope entry: subtree range plus
+            // the scope directory itself (parity with the dense allow-list, so
+            // a scoped search can return the directory it was scoped to).
+            // Harmless for files, which can never equal a directory path.
             sql.push_str(&format!(
-                "(t.path >= ?{} AND t.path < ?{})",
-                2 + i * 2,
-                3 + i * 2
+                "(t.path >= ?{} AND t.path < ?{} OR t.path = ?{})",
+                2 + i * 3,
+                3 + i * 3,
+                4 + i * 3
             ));
         }
         sql.push(')');
     }
     sql.push_str(&format!(" ORDER BY {rank} LIMIT ?"));
-    sql.push_str(&(2 + req.scope.len() * 2).to_string());
+    sql.push_str(&(2 + req.scope.len() * 3).to_string());
 
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(match_expr)];
     for dir in &req.scope {
         let (lo, hi) = dir_prefix_range(dir);
+        let bare = dir.to_string_lossy().trim_end_matches('/').to_string();
         binds.push(Box::new(lo));
         binds.push(Box::new(hi));
+        binds.push(Box::new(bare));
     }
     binds.push(Box::new(CANDIDATES as i64));
 

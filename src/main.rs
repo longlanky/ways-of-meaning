@@ -414,8 +414,9 @@ fn cmd_index(paths: &Paths, args: cli::IndexArgs) -> Result<()> {
     };
 
     // Loading the model costs a download on first use and a second or two after,
-    // so skip it entirely when nothing will be embedded.
-    let embedder = if args.dry_run {
+    // so skip it entirely when nothing will be embedded (`--dry-run`,
+    // `--no-embed` lexical fast path).
+    let embedder = if args.dry_run || args.no_embed {
         None
     } else {
         Some(embed::onnx::OnnxEmbedder::load_on(paths, &cfg.model, cfg.device)?)
@@ -425,7 +426,7 @@ fn cmd_index(paths: &Paths, args: cli::IndexArgs) -> Result<()> {
         force: args.force,
         dry_run: args.dry_run,
         only_root,
-        embed: !args.dry_run,
+        embed: !args.dry_run && !args.no_embed,
         progress: true,
     };
 
@@ -548,6 +549,14 @@ fn cmd_status(paths: &Paths, args: cli::StatusArgs) -> Result<()> {
         } else {
             println!("INCONSISTENT - run `wom index --rebuild`");
         }
+        // Vectors are a cache joined through SQLite (`vec_row == id` + the
+        // scope allow-list): every live `vec_row` must resolve to a live vector
+        // row, otherwise dense search silently drops files.
+        print!("verify   vector index ... ");
+        match verify_vectors(paths, &db, &model, dim) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => println!("INCONSISTENT ({e}) - run `wom index --rebuild`"),
+        }
     }
 
     println!("\nroots");
@@ -595,6 +604,53 @@ fn vector_count(path: &Path, dim: usize, model: &str) -> String {
         Ok(s) => s.high_water().to_string(),
         // A dim/model mismatch is already reported on the model line above.
         Err(_) => "incompatible".into(),
+    }
+}
+
+/// Verify the DB↔vector join invariant: SQLite is the source of truth, the
+/// `.i8` files are a cache. Every `files.vec_row != -1` must be in range and
+/// live; anything else means dense search silently drops (or ghosts) files.
+fn verify_vectors(paths: &Paths, db: &Db, model: &str, dim: Option<usize>) -> Result<String> {
+    let Some(d) = dim else {
+        return Ok("skipped (no model recorded)".to_string());
+    };
+    if model == "-" || !paths.file_vectors().exists() {
+        return Ok("skipped (no vector index)".to_string());
+    }
+    let store = VectorStore::open(&paths.file_vectors(), d, model)?;
+    let hw = store.high_water() as i64;
+    let bad_range: i64 = db.conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE vec_row != -1 AND (vec_row < 0 OR vec_row >= ?1)",
+        rusqlite::params![hw],
+        |r| r.get(0),
+    )?;
+    if bad_range > 0 {
+        anyhow::bail!("{bad_range} rows point outside the vector store");
+    }
+    // Sample liveness: every claimed row should read back (cleared rows read
+    // as None). Full scan of 300k rows is wasteful; 1024 probes catch systemic
+    // zeroing failures.
+    let ids: Vec<i64> = db
+        .conn
+        .prepare("SELECT vec_row FROM files WHERE vec_row != -1 LIMIT 1024")?
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut dead = 0;
+    for id in &ids {
+        if store.get(*id as usize).is_none() {
+            dead += 1;
+        }
+    }
+    if dead > 0 && dead == ids.len() && !ids.is_empty() {
+        anyhow::bail!("all {dead} sampled vectors are dead (interrupted index?)");
+    }
+    if dead > 0 {
+        Ok(format!(
+            "consistent ({} live sampled, {dead} dead — re-index recommended)",
+            ids.len() - dead as usize
+        ))
+    } else {
+        Ok("consistent".to_string())
     }
 }
 

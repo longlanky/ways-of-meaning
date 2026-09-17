@@ -39,6 +39,9 @@ pub struct RerankerSpec {
     pub onnx_path: &'static str,
     /// Path of the tokenizer JSON within the repo.
     pub tokenizer_path: &'static str,
+    /// Pinned blake3 hex digests (see `ModelSpec::onnx_hash`).
+    pub onnx_hash: Option<&'static str>,
+    pub tokenizer_hash: Option<&'static str>,
     /// Pairs are truncated to this many tokens (the model's own limit).
     pub max_seq: usize,
     /// Approximate download size, for the progress bar.
@@ -55,6 +58,8 @@ pub const RERANKER_REGISTRY: &[RerankerSpec] = &[
         repo: "Xenova/ms-marco-MiniLM-L-6-v2",
         onnx_path: "onnx/model_int8.onnx",
         tokenizer_path: "tokenizer.json",
+        onnx_hash: None,
+        tokenizer_hash: None,
         max_seq: 512,
         approx_mb: 22,
         note: "default; tiny, English, trained on MS MARCO relevance judgements",
@@ -64,6 +69,8 @@ pub const RERANKER_REGISTRY: &[RerankerSpec] = &[
         repo: "jinaai/jina-reranker-v2-base-multilingual",
         onnx_path: "onnx/model_int8.onnx",
         tokenizer_path: "tokenizer.json",
+        onnx_hash: None,
+        tokenizer_hash: None,
         max_seq: 1024,
         approx_mb: 267,
         note: "multilingual; ~12x the size and per-query cost of the default",
@@ -107,6 +114,8 @@ impl OnnxReranker {
             spec.onnx_path,
             spec.tokenizer_path,
             spec.approx_mb,
+            spec.onnx_hash,
+            spec.tokenizer_hash,
         )?;
 
         let mut tokenizer = Tokenizer::from_file(&files.tokenizer)

@@ -136,17 +136,13 @@ pub(crate) fn build_session(onnx: &std::path::Path, device: crate::config::Devic
         .map(|n| n.get())
         .unwrap_or(4);
 
-    // Regenerate the cache if the source model is newer, so a re-downloaded or
-    // replaced model is never served from a stale optimised copy.
+    // Regenerate the cache unless the sidecar proves it matches this exact
+    // source build: mtime alone is fooled by clock skew and coarse granularity,
+    // so the sidecar records source length + mtime + wom version. A substituted
+    // model (different bytes, same or older mtime) invalidates the cache.
     let optimised = onnx.with_extension("opt.onnx");
-    let use_cache = match (optimised.metadata(), onnx.metadata()) {
-        (Ok(c), Ok(m)) => match (c.modified(), m.modified()) {
-            (Ok(ct), Ok(mt)) => ct >= mt,
-            // Without usable timestamps, prefer correctness over speed.
-            _ => false,
-        },
-        _ => false,
-    };
+    let meta_path = onnx.with_extension("opt.meta");
+    let use_cache = cache_is_fresh(onnx, &optimised, &meta_path);
     let source: &std::path::Path = if use_cache { &optimised } else { onnx };
 
     let builder = ort_ctx(Session::builder(), "creating ORT session builder")?;
@@ -182,7 +178,58 @@ pub(crate) fn build_session(onnx: &std::path::Path, device: crate::config::Devic
         builder.commit_from_file(source),
         &format!("loading ONNX graph {}", source.display()),
     )?;
+    if !use_cache {
+        write_cache_meta(onnx, &meta_path);
+    }
     Ok((session, on_gpu))
+}
+
+/// Sidecar format: `wom_version\nsource_len\nsource_mtime_nanos\n`.
+fn cache_is_fresh(
+    onnx: &std::path::Path,
+    optimised: &std::path::Path,
+    meta_path: &std::path::Path,
+) -> bool {
+    let (Ok(src), Ok(_opt), Ok(meta)) = (
+        std::fs::metadata(onnx),
+        std::fs::metadata(optimised),
+        std::fs::read_to_string(meta_path),
+    ) else {
+        return false;
+    };
+    let mut lines = meta.lines();
+    let (Some(ver), Some(len), Some(mtime)) = (lines.next(), lines.next(), lines.next()) else {
+        return false;
+    };
+    if ver != env!("CARGO_PKG_VERSION") {
+        return false;
+    }
+    if len.parse::<u64>().ok() != Some(src.len()) {
+        return false;
+    }
+    let src_mtime = src
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().to_string());
+    if src_mtime.as_deref() != Some(mtime) {
+        return false;
+    }
+    true
+}
+
+fn write_cache_meta(onnx: &std::path::Path, meta_path: &std::path::Path) {
+    let Ok(src) = std::fs::metadata(onnx) else {
+        return;
+    };
+    let mtime = src
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_default();
+    let content = format!("{}\n{}\n{mtime}\n", env!("CARGO_PKG_VERSION"), src.len());
+    std::fs::write(meta_path, content).ok();
 }
 
 impl OnnxEmbedder {

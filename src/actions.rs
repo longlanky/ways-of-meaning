@@ -173,11 +173,35 @@ pub fn copy_to_clipboard(text: &str) -> Result<&'static str> {
 
 /// Write the result list to `path`, one per line.
 ///
-/// Refuses to clobber an existing file: the `s` key is one keystroke, and losing
-/// an unrelated file to a mistyped name would be a poor trade.
+/// Sandboxed to a bare filename in the current directory: absolute paths,
+/// parent components (`..`, `/`, `~`-leading) are rejected, so the one-keystroke
+/// `s` action cannot write outside the drawer you are in. Pipe/redirect remains
+/// the escape hatch for saving elsewhere.
+///
+/// Uses `create_new` (O_CREAT|O_EXCL) so the no-clobber check is atomic: no
+/// TOCTOU window, and dangling symlinks fail instead of being followed.
 pub fn save_results(results: &[SearchResult], query: &str, path: &Path) -> Result<usize> {
-    if path.exists() {
-        bail!("{} already exists; pick another name", path.display());
+    let s = path.to_string_lossy();
+    if s.starts_with('~') {
+        bail!("`~` is not expanded here; save to a plain filename or redirect output instead");
+    }
+    if path.is_absolute() {
+        bail!(
+            "{} is absolute; `s` saves to the current directory only",
+            path.display()
+        );
+    }
+    // Exactly one normal component: rejects `a/b`, `..`, `/`, empty, prefixes.
+    {
+        use std::path::Component;
+        let mut comps = path.components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(_)), None) => {}
+            _ => bail!(
+                "{} is not a plain filename; `s` saves to the current directory only",
+                path.display()
+            ),
+        }
     }
     let mut out = String::new();
     out.push_str(&format!("# wom results for: {query}\n"));
@@ -186,7 +210,22 @@ pub fn save_results(results: &[SearchResult], query: &str, path: &Path) -> Resul
         out.push_str(&r.display());
         out.push('\n');
     }
-    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow::anyhow!("{} already exists; pick another name", path.display())
+                } else {
+                    anyhow::Error::from(e).context(format!("writing {}", path.display()))
+                }
+            })?;
+        f.write_all(out.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
     Ok(results.len())
 }
 
@@ -295,9 +334,10 @@ mod tests {
 
     #[test]
     fn save_results_writes_one_line_per_result() {
-        let dir = std::env::temp_dir().join("wom-save-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("out.txt");
+        // Sandboxed to cwd: use a unique bare filename in the test process's
+        // cwd (no set_current_dir — that races under the parallel harness).
+        let name = format!("wom-save-test-{}.txt", std::process::id());
+        let path = PathBuf::from(&name);
         std::fs::remove_file(&path).ok();
 
         let results = vec![
@@ -306,7 +346,7 @@ mod tests {
         ];
         let n = save_results(&results, "employment documents", &path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&path).ok();
 
         assert_eq!(n, 2);
         assert!(text.contains("# wom results for: employment documents"));
@@ -316,17 +356,40 @@ mod tests {
 
     #[test]
     fn save_results_refuses_to_overwrite() {
-        let dir = std::env::temp_dir().join("wom-save-clobber");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("existing.txt");
+        let name = format!("wom-save-clobber-{}.txt", std::process::id());
+        let path = PathBuf::from(&name);
         std::fs::write(&path, "precious").unwrap();
 
         let err = save_results(&[], "q", &path).unwrap_err().to_string();
         let still_there = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&path).ok();
 
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(still_there, "precious", "existing file was clobbered");
+    }
+
+    #[test]
+    fn save_results_rejects_paths_outside_the_cwd() {
+        for bad in [
+            "/tmp/abs.txt",
+            "../evil.txt",
+            "a/b.txt",
+            "..",
+            "/",
+            "~/out.txt",
+            "~",
+            "",
+        ] {
+            let err = save_results(&[], "q", Path::new(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("current directory")
+                    || err.contains("plain filename")
+                    || err.contains("not expanded"),
+                "got for {bad:?}: {err}"
+            );
+        }
     }
 
     #[test]

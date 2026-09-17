@@ -204,6 +204,99 @@ impl Db {
         Ok((f, d))
     }
 
+    /// Per-root generation key: the last scan generation that covered `root`.
+    /// A global `scan_gen` counter is still bumped once per scan (so `seen_scan`
+    /// stays comparable), but scoped scans only garbage-collect inside the roots
+    /// they actually walked. Without this, `wom index --root A` would mark every
+    /// other root unseen and delete it.
+    pub fn root_gen_key(root: &str) -> String {
+        format!("scan_gen:{root}")
+    }
+
+    /// Last wall-clock scan time for one root, for per-root freshness.
+    pub fn root_last_scan_key(root: &str) -> String {
+        format!("last_scan_at:{root}")
+    }
+
+    pub fn set_root_gen(&self, root: &str, scan_gen: i64) -> Result<()> {
+        self.set_meta(&Self::root_gen_key(root), &scan_gen.to_string())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_root_gen(&self, root: &str) -> Result<Option<i64>> {
+        self.get_meta_i64(&Self::root_gen_key(root))
+    }
+
+    pub fn set_root_last_scan(&self, root: &str, ts: i64) -> Result<()> {
+        self.set_meta(&Self::root_last_scan_key(root), &ts.to_string())
+    }
+
+    /// Build a `(path >= ? AND path < ?)` disjunction over `prefixes`, with
+    /// placeholders starting at `start_idx` (1-based, for rusqlite `?N`).
+    fn prefix_predicate(prefixes: &[String], start_idx: usize, col: &str) -> String {
+        prefixes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let lo = start_idx + i * 2;
+                let hi = lo + 1;
+                format!("({col} >= ?{lo} AND {col} < ?{hi})")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
+    fn prefix_bounds(prefixes: &[String]) -> Vec<(String, String)> {
+        prefixes.iter().map(|p| prefix_range(p)).collect()
+    }
+
+    /// Delete only rows under `prefixes` (trailing-slash directory prefixes)
+    /// that this scan generation did not observe. Other roots are untouched.
+    pub fn gc_under(&self, prefixes: &[String], scan_gen: i64) -> Result<(usize, usize)> {
+        if prefixes.is_empty() {
+            return Ok((0, 0));
+        }
+        let bounds = Self::prefix_bounds(prefixes);
+        // seen_scan is ?1; prefix bounds start at ?2.
+        let file_pred = Self::prefix_predicate(prefixes, 2, "path");
+        let tx = self.conn.unchecked_transaction()?;
+        let mut binds: Vec<String> = vec![scan_gen.to_string()];
+        for (lo, hi) in &bounds {
+            binds.push(lo.clone());
+            binds.push(hi.clone());
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        // Note: seen_scan binds as TEXT; SQLite type affinity compares it
+        // numerically against the INTEGER column, matching the unscoped `gc`.
+        // FTS rows must go first (no FK cascade from files/dirs).
+        tx.execute(
+            &format!(
+                "DELETE FROM files_fts WHERE rowid IN \
+                 (SELECT id FROM files WHERE seen_scan != ?1 AND ({file_pred}))"
+            ),
+            refs.as_slice(),
+        )?;
+        let dir_pred = Self::prefix_predicate(prefixes, 2, "path");
+        tx.execute(
+            &format!(
+                "DELETE FROM dirs_fts WHERE rowid IN \
+                 (SELECT id FROM dirs WHERE seen_scan != ?1 AND ({dir_pred}))"
+            ),
+            refs.as_slice(),
+        )?;
+        let f = tx.execute(
+            &format!("DELETE FROM files WHERE seen_scan != ?1 AND ({file_pred})"),
+            refs.as_slice(),
+        )?;
+        let d = tx.execute(
+            &format!("DELETE FROM dirs WHERE seen_scan != ?1 AND ({dir_pred})"),
+            refs.as_slice(),
+        )?;
+        tx.commit()?;
+        Ok((f, d))
+    }
+
     /// Replace the full-text row for one directory. See [`Self::put_fts`].
     pub fn put_dir_fts(&self, dir_id: i64, path: &str, name_tokens: &str) -> Result<()> {
         self.delete_dir_fts(dir_id)?;
@@ -274,6 +367,56 @@ impl Db {
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params![scan_gen, NO_VEC], |r| r.get::<_, i64>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Vector rows under `prefixes` that this scan did not observe. Scoped twin
+    /// of [`Self::vec_rows_not_seen`], so a single-root refresh zeroes only its
+    /// own deletions instead of every other root's live vectors.
+    pub fn vec_rows_not_seen_under(
+        &self,
+        table: &str,
+        prefixes: &[String],
+        scan_gen: i64,
+    ) -> Result<Vec<i64>> {
+        assert!(
+            table == "files" || table == "dirs",
+            "vec_rows_not_seen_under takes only files/dirs"
+        );
+        if prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bounds = Self::prefix_bounds(prefixes);
+        let pred = Self::prefix_predicate(prefixes, 3, "path");
+        let sql = format!(
+            "SELECT vec_row FROM {table} \
+             WHERE seen_scan != ?1 AND vec_row != ?2 AND ({pred})"
+        );
+        let mut binds: Vec<String> = vec![scan_gen.to_string(), NO_VEC.to_string()];
+        for (lo, hi) in &bounds {
+            binds.push(lo.clone());
+            binds.push(hi.clone());
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(refs.as_slice(), |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn file_vec_rows_not_seen_under(
+        &self,
+        prefixes: &[String],
+        scan_gen: i64,
+    ) -> Result<Vec<i64>> {
+        self.vec_rows_not_seen_under("files", prefixes, scan_gen)
+    }
+
+    pub fn dir_vec_rows_not_seen_under(
+        &self,
+        prefixes: &[String],
+        scan_gen: i64,
+    ) -> Result<Vec<i64>> {
+        self.vec_rows_not_seen_under("dirs", prefixes, scan_gen)
     }
 
     /// How many files each extractor produced text for, best-covered first. Backs
@@ -557,6 +700,54 @@ mod tests {
         let got = db.file_stats_under("/home/n/Documents/").unwrap();
         assert_eq!(got.len(), 1);
         assert!(got.contains_key("/home/n/Documents/a.txt"));
+    }
+
+    #[test]
+    fn scoped_gc_preserves_other_roots() {
+        // Regression for `--only-root` wiping every other root: scoped GC must
+        // only collect rows under the scanned prefixes.
+        let db = Db::open_in_memory().unwrap();
+        insert_file(&db, "/a/kept.txt", 2);
+        insert_file(&db, "/a/stale.txt", 1);
+        insert_file(&db, "/b/untouched.txt", 1);
+        let (f, _) = db.gc_under(&["/a/".to_string()], 2).unwrap();
+        assert_eq!(f, 1);
+        assert_eq!(db.count_files().unwrap(), 2);
+        let mut got: Vec<String> = db
+            .conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["/a/kept.txt", "/b/untouched.txt"]);
+        assert!(db.fts_is_consistent().unwrap());
+    }
+
+    #[test]
+    fn scoped_vec_rows_only_cover_the_scanned_prefix() {
+        let db = Db::open_in_memory().unwrap();
+        let a = insert_file(&db, "/a/x.txt", 1);
+        let b = insert_file(&db, "/b/y.txt", 1);
+        db.conn
+            .execute("UPDATE files SET vec_row = id WHERE id IN (?1, ?2)", params![a, b])
+            .unwrap();
+        let got = db
+            .file_vec_rows_not_seen_under(&["/a/".to_string()], 2)
+            .unwrap();
+        assert_eq!(got, vec![a]);
+    }
+
+    #[test]
+    fn root_gen_keys_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_root_gen("/a").unwrap(), None);
+        db.set_root_gen("/a", 7).unwrap();
+        db.set_root_last_scan("/a", 123).unwrap();
+        assert_eq!(db.get_root_gen("/a").unwrap(), Some(7));
+        assert_eq!(db.get_meta_i64("last_scan_at:/a").unwrap(), Some(123));
     }
 
 }

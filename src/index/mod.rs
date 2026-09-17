@@ -229,13 +229,70 @@ pub fn scan(
         let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
         stats.dirs = upsert_dirs(&db, &all_dirs, &root_paths, scan_gen)?;
 
+        // Per-root generations: a scoped `--root` scan must only collect garbage
+        // inside the roots it walked. A global GC here would mark every other
+        // root unseen and delete it. Prefixes carry trailing slashes so
+        // `/p/` never matches `/p-old/`.
+        let scoped = opts.only_root.is_some();
+        let prefixes: Vec<String> = root_paths
+            .iter()
+            .map(|r| format!("{}/", path_str(r)))
+            .collect();
         // Deleted files must have their vector rows zeroed as well as their
         // metadata removed, or a stale vector would keep matching queries.
-        let doomed = db.vec_rows_not_seen(scan_gen)?;
-        let doomed_dirs = db.dir_vec_rows_not_seen(scan_gen)?;
-        if let Some(s) = store.as_mut() {
-            for row in &doomed {
-                s.clear(*row as usize)?;
+        // Always open the stores for clearing, even when this scan embedded
+        // nothing (`--no-embed`/lexical): otherwise deletions leak live vectors.
+        let (doomed, doomed_dirs) = if scoped {
+            (
+                db.file_vec_rows_not_seen_under(&prefixes, scan_gen)?,
+                db.dir_vec_rows_not_seen_under(&prefixes, scan_gen)?,
+            )
+        } else {
+            (
+                db.vec_rows_not_seen(scan_gen)?,
+                db.dir_vec_rows_not_seen(scan_gen)?,
+            )
+        };
+        // Clear file vectors whenever we have doomed rows and can open the
+        // store: prefer the live `store`, else the embedder's dim/model, else
+        // the dim/model recorded in the DB from a previous embedded scan
+        // (`--no-embed` lexical refresh must still zero deletions).
+        if !doomed.is_empty() {
+            if let Some(s) = store.as_mut() {
+                for row in &doomed {
+                    s.clear(*row as usize)?;
+                }
+            } else {
+                let open = |dim: usize, model: &str| {
+                    VectorStore::open(&paths.file_vectors(), dim, model)
+                };
+                if let Some(e) = embedder {
+                    if paths.file_vectors().exists() {
+                        let mut s = open(e.dim(), e.model_id())?;
+                        for row in &doomed {
+                            s.clear(*row as usize)?;
+                        }
+                        s.flush()?;
+                    }
+                } else if let (Some(m), Some(d)) = (
+                    db.get_meta("model_id")?,
+                    db.get_meta("dim")?.and_then(|v| v.parse::<usize>().ok()),
+                ) {
+                    if paths.file_vectors().exists() {
+                        match open(d, &m) {
+                            Ok(mut s) => {
+                                for row in &doomed {
+                                    s.clear(*row as usize).ok();
+                                }
+                                s.flush().ok();
+                            }
+                            // Model swap or corrupt store: metadata GC below
+                            // still removes rows; stale bytes are unreachable
+                            // via the DB-joined dense path.
+                            Err(_) => {}
+                        }
+                    }
+                }
             }
         }
         if !doomed_dirs.is_empty() {
@@ -245,9 +302,28 @@ pub fn scan(
                     ds.clear(*row as usize)?;
                 }
                 ds.flush()?;
+            } else if let (Some(m), Some(d)) = (
+                db.get_meta("model_id")?,
+                db.get_meta("dim")?.and_then(|v| v.parse::<usize>().ok()),
+            ) {
+                if paths.dir_vectors().exists() {
+                    if let Ok(mut ds) = VectorStore::open(&paths.dir_vectors(), d, &m) {
+                        for row in &doomed_dirs {
+                            ds.clear(*row as usize).ok();
+                        }
+                        ds.flush().ok();
+                    }
+                }
+                // Else: metadata GC below still removes the rows so they cannot
+                // match via SQLite; stale vector bytes are unreachable because
+                // every dense query joins through the DB allow-list.
             }
         }
-        let (df, dd) = db.gc(scan_gen)?;
+        let (df, dd) = if scoped {
+            db.gc_under(&prefixes, scan_gen)?
+        } else {
+            db.gc(scan_gen)?
+        };
         stats.deleted_files = df;
         stats.deleted_dirs = dd;
 
@@ -262,7 +338,13 @@ pub fn scan(
             let root_paths: Vec<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
             rollup_dirs(&db, fs, &mut ds, e, &root_paths)?;
         }
-        db.set_meta("last_scan_at", &now_secs().to_string())?;
+        let now = now_secs();
+        db.set_meta("last_scan_at", &now.to_string())?;
+        for r in &root_paths {
+            let key = path_str(r);
+            db.set_root_gen(&key, scan_gen).ok();
+            db.set_root_last_scan(&key, now).ok();
+        }
         if let Some(e) = embedder {
             db.set_meta("model_id", e.model_id())?;
             db.set_meta("dim", &e.dim().to_string())?;
@@ -291,6 +373,17 @@ fn prepare(
     known: &HashMap<String, FileStat>,
     opts: &ScanOptions,
 ) -> Option<Prepared> {
+    // Drop files that vanished between the walk and now. Returning None lets
+    // the caller skip them entirely; degrading to NameOnly here would insert a
+    // fresh row with a new seen_scan that GC can never collect (a ghost).
+    // symlink_metadata (not metadata) so a broken symlink itself is still seen.
+    match std::fs::symlink_metadata(&f.path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // Permission or transient IO errors: fall through to extract(), which
+        // degrades to NameOnly rather than aborting the scan.
+        Err(_) => {}
+    }
     let key = path_str(&f.path);
     let prev = known.get(&key);
 
@@ -356,7 +449,13 @@ fn prepare(
     })
 }
 
-/// Persist one batch: metadata, full text, and vectors, in a single transaction.
+/// Persist one batch: metadata, full text, and vectors.
+///
+/// Two-phase commit: tx1 writes metadata/FTS but defers `content_hash` for rows
+/// that are about to be embedded; tx2 writes `vec_row + content_hash` only after
+/// `embed_docs` succeeds. If embedding fails, the old hash (or NULL for new
+/// files) is preserved, so the next scan sees `!text_same || vec_row == NO_VEC`
+/// and retries instead of marking the stale vector `unchanged` forever.
 fn write_batch(
     db: &Db,
     mut store: Option<&mut VectorStore>,
@@ -365,6 +464,9 @@ fn write_batch(
     scan_gen: i64,
     stats: &mut ScanStats,
 ) -> Result<()> {
+    // Will embedding actually be attempted for this batch? Both must be present;
+    // otherwise every row's hash can be committed immediately (lexical scan).
+    let will_embed = embedder.is_some() && store.is_some();
     let tx = db.conn.unchecked_transaction()?;
 
     // Assign ids first, because the vector row is the file id and the embeddings
@@ -382,41 +484,77 @@ fn write_batch(
             continue;
         }
 
+        // Defer the hash when this row is headed for the embedder: committing it
+        // now would poison the change-detection cache if embedding then failed.
+        let defer_hash = will_embed && p.needs_embed && !p.embed_text.is_empty();
         let id = match p.existing_id {
             Some(id) => {
-                tx.execute(
-                    "UPDATE files SET mtime_ns=?1, size=?2, content_hash=?3,
-                        extract_kind=?4, snippet=?5, seen_scan=?6
-                     WHERE id=?7",
-                    params![
-                        p.mtime_ns,
-                        p.size as i64,
-                        p.hash,
-                        p.kind.as_str(),
-                        p.snippet,
-                        scan_gen,
-                        id
-                    ],
-                )?;
+                if defer_hash {
+                    tx.execute(
+                        "UPDATE files SET mtime_ns=?1, size=?2,
+                            extract_kind=?3, snippet=?4, seen_scan=?5
+                         WHERE id=?6",
+                        params![
+                            p.mtime_ns,
+                            p.size as i64,
+                            p.kind.as_str(),
+                            p.snippet,
+                            scan_gen,
+                            id
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE files SET mtime_ns=?1, size=?2, content_hash=?3,
+                            extract_kind=?4, snippet=?5, seen_scan=?6
+                         WHERE id=?7",
+                        params![
+                            p.mtime_ns,
+                            p.size as i64,
+                            p.hash,
+                            p.kind.as_str(),
+                            p.snippet,
+                            scan_gen,
+                            id
+                        ],
+                    )?;
+                }
                 stats.updated += 1;
                 id
             }
             None => {
-                tx.execute(
-                    "INSERT INTO files
-                       (path, mtime_ns, size, content_hash, extract_kind,
-                        snippet, seen_scan)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                    params![
-                        path_str(&p.path),
-                        p.mtime_ns,
-                        p.size as i64,
-                        p.hash,
-                        p.kind.as_str(),
-                        p.snippet,
-                        scan_gen
-                    ],
-                )?;
+                if defer_hash {
+                    tx.execute(
+                        "INSERT INTO files
+                           (path, mtime_ns, size, content_hash, extract_kind,
+                            snippet, seen_scan)
+                         VALUES (?1,?2,?3,NULL,?4,?5,?6)",
+                        params![
+                            path_str(&p.path),
+                            p.mtime_ns,
+                            p.size as i64,
+                            p.kind.as_str(),
+                            p.snippet,
+                            scan_gen
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO files
+                           (path, mtime_ns, size, content_hash, extract_kind,
+                            snippet, seen_scan)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        params![
+                            path_str(&p.path),
+                            p.mtime_ns,
+                            p.size as i64,
+                            p.hash,
+                            p.kind.as_str(),
+                            p.snippet,
+                            scan_gen
+                        ],
+                    )?;
+                }
                 stats.added += 1;
                 tx.last_insert_rowid()
             }
@@ -444,6 +582,9 @@ fn write_batch(
         .enumerate()
         .filter(|(_, p)| p.needs_embed && !p.embed_text.is_empty())
         .collect();
+    if todo.is_empty() {
+        return Ok(());
+    }
 
     // Hand the whole batch over at once: the embedder sorts by token length
     // internally, and it can only do that across everything it is given.
@@ -451,13 +592,13 @@ fn write_batch(
     let vecs = embedder.embed_docs(&texts)?;
 
     let tx = db.conn.unchecked_transaction()?;
-    for ((idx, _), v) in todo.iter().zip(&vecs) {
+    for ((idx, p), v) in todo.iter().zip(&vecs) {
         let id = ids[*idx];
         // vec_row == files.id keeps the mapping trivial and self-healing.
         store.put(id as usize, v)?;
         tx.execute(
-            "UPDATE files SET vec_row = ?1 WHERE id = ?2",
-            params![id, id],
+            "UPDATE files SET vec_row = ?1, content_hash = ?2 WHERE id = ?3",
+            params![id, p.hash, id],
         )?;
         stats.embedded += 1;
     }
