@@ -377,3 +377,96 @@ fn a_query_with_no_index_fails_with_a_useful_message() {
         "unhelpful error: {err}"
     );
 }
+
+#[test]
+fn topics_build_without_vectors_is_refused() {
+    let h = Harness::new("topics-novec");
+    let corpus = h.corpus.to_string_lossy().into_owned();
+    h.run(&["init", "--add", &corpus, "--yes"]);
+    let (_, err, ok) = h.run(&["index", "--no-embed", "--now"]);
+    assert!(ok, "index --no-embed failed: {err}");
+
+    // Listing an index with no topic model is a message, not an error.
+    let (out, _, ok) = h.run(&["topics"]);
+    assert!(ok, "topics with no build should not fail: {out}");
+    assert!(out.contains("No topics yet"), "unexpected: {out}");
+
+    let (_, err, ok) = h.run(&["topics", "build"]);
+    assert!(!ok, "topics build should refuse an index with no vectors");
+    assert!(err.contains("no embedded"), "unhelpful error: {err}");
+}
+
+#[test]
+fn topics_build_list_show_and_filter() {
+    if !model_available() {
+        return;
+    }
+    let h = Harness::new("topics");
+    let corpus = h.corpus.to_string_lossy().into_owned();
+    h.run(&["init", "--add", &corpus, "--yes"]);
+    let (_, err, ok) = h.run(&["index"]);
+    assert!(ok, "index failed: {err}");
+
+    let (out, err, ok) = h.run(&[
+        "topics", "build", "--k", "2", "--epochs", "2", "--sample", "1000",
+    ]);
+    assert!(ok, "topics build failed: {err}");
+    assert!(out.contains("built"), "unexpected build output: {out}");
+
+    // Piped output is the stable `id<TAB>files<TAB>label` form; `wom topics`
+    // and `wom topics list` must be the same command.
+    let (list, _, ok) = h.run(&["topics", "list"]);
+    assert!(ok);
+    assert!(!list.trim().is_empty(), "topics list was empty");
+    let (bare, _, ok) = h.run(&["topics"]);
+    assert!(ok);
+    assert_eq!(bare, list, "`wom topics` should equal `wom topics list`");
+
+    let id = list
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').next())
+        .expect("a topic id")
+        .to_string();
+
+    let (shown, err, ok) = h.run(&["topics", "show", &id, "--no-tui", "--limit", "50"]);
+    assert!(ok, "topics show failed: {err}");
+    assert!(!shown.trim().is_empty(), "topic {id} had no files");
+
+    // Pick a word from the first member's name, so the lexical query is
+    // guaranteed to match at least that file.
+    let first = shown.lines().next().unwrap();
+    let stem = Path::new(first)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let token = stem
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|word| word.len() >= 3)
+        .unwrap_or("wom")
+        .to_string();
+
+    let (filtered, err, ok) = h.run(&[
+        "--lexical", "--topic", &id, &token, "-n", "50", "--no-tui",
+    ]);
+    assert!(ok, "topic-filtered search failed: {err}");
+    assert!(
+        !filtered.trim().is_empty(),
+        "no topic members matched {token:?}: {shown}"
+    );
+    for line in filtered.lines() {
+        assert!(
+            shown.lines().any(|member| member == line),
+            "topic filter leaked an outsider: {line}"
+        );
+    }
+
+    let (status, _, ok) = h.run(&["status"]);
+    assert!(ok);
+    assert!(status.contains("topics   "), "status has no topics line: {status}");
+
+    let (_, _, ok) = h.run(&["topics", "show", "999", "--no-tui"]);
+    assert!(!ok, "an unknown topic should fail");
+    let (_, _, ok) = h.run(&["--lexical", "--topic", "999", "anything", "--no-tui"]);
+    assert!(!ok, "an unknown topic filter should fail");
+}

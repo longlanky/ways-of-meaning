@@ -3,17 +3,21 @@
 mod actions;
 mod bench;
 mod cli;
+mod cluster;
 mod config;
 mod db;
 mod embed;
 mod index;
 mod rerank;
 mod search;
+mod topics;
 mod tui;
 mod vectors;
 
-use anyhow::{Context, Result, bail};
-use cli::{Cli, Command, InitArgs, ModelAction};
+use anyhow::{Context, Result, anyhow, bail};
+use cli::{
+    Cli, Command, InitArgs, ModelAction, TopicsAction, TopicsBuildArgs, TopicsShowArgs,
+};
 use config::{Config, Paths, Profile, Root, expand_path};
 use db::Db;
 use rerank::Reranker;
@@ -22,6 +26,13 @@ use std::path::{Path, PathBuf};
 use vectors::VectorStore;
 
 fn main() {
+    // Rust ignores SIGPIPE by default, so a closed stdout (the README's
+    // `wom bosnia | head -3`) turns the next println! into a panic. Restore the
+    // Unix default: die quietly on a broken pipe, like every other filter.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     if let Err(e) = run() {
         eprintln!("wom: {e}");
         for cause in e.chain().skip(1) {
@@ -43,6 +54,7 @@ fn run() -> Result<()> {
         Command::Index(args) => cmd_index(&paths, args),
         Command::Search(args) => cmd_search(&paths, args),
         Command::Bench(args) => cmd_bench(&paths, args),
+        Command::Topics { action } => cmd_topics(&paths, action),
     }
 }
 
@@ -223,6 +235,12 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
     let cfg = Config::load(paths)?;
     let query = args.to_query()?;
     if query.text.trim().is_empty() {
+        if let Some(id) = args.topic {
+            bail!(
+                "nothing to search for; browse topic {id} with `wom topics show {id}`, \
+                 or add words to the query"
+            );
+        }
         bail!("nothing to search for. Try `wom employment documents`.");
     }
 
@@ -231,6 +249,24 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
         bail!("no index yet. Run `wom init` then `wom index`.");
     }
     let db = Db::open(&db_path)?;
+
+    // Validate the topic before loading a model: a bad id is a typo, not a
+    // model problem, and saying so immediately is cheaper.
+    let topic_label = match args.topic {
+        Some(id) => {
+            let state = topics::staleness(&db)?;
+            if !state.built {
+                bail!("no topics yet. Run `wom topics build` first.");
+            }
+            if let Some(note) = topics::stale_note(&state) {
+                eprintln!("wom: {note}");
+            }
+            let topic = topics::summary(&db, id)?
+                .ok_or_else(|| anyhow!("topic {id} does not exist; run `wom topics`"))?;
+            Some(topic.label)
+        }
+        None => None,
+    };
 
     // Spec item 3: refresh on the configured schedule. The scan runs detached so
     // this query answers from the index that already exists — waiting minutes for
@@ -276,6 +312,7 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
         min_similarity: args
             .min_similarity
             .unwrap_or_else(|| cfg.resolved_min_similarity()),
+        topic: args.topic,
     };
 
     let results = search::search(
@@ -304,6 +341,8 @@ fn cmd_search(paths: &Paths, args: cli::SearchArgs) -> Result<()> {
             reranker.as_ref().map(|r| r as &dyn rerank::Reranker),
             &req,
             results,
+            topic_label,
+            None,
         );
         return tui::run(&mut app);
     }
@@ -523,6 +562,7 @@ fn cmd_status(paths: &Paths, args: cli::StatusArgs) -> Result<()> {
     let dirs = db.count_dirs()?;
     println!("\nfiles    {files} indexed, {embedded} embedded");
     println!("dirs     {dirs}");
+    print_topics_line(&db);
 
     let coverage = db.extract_coverage()?;
     if !coverage.is_empty() {
@@ -877,6 +917,212 @@ fn cmd_bench(paths: &Paths, args: cli::BenchArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- topics
+
+fn cmd_topics(paths: &Paths, action: Option<TopicsAction>) -> Result<()> {
+    match action {
+        None | Some(TopicsAction::List) => cmd_topics_list(paths),
+        Some(TopicsAction::Build(args)) => cmd_topics_build(paths, args),
+        Some(TopicsAction::Show(args)) => cmd_topics_show(paths, args),
+    }
+}
+
+fn cmd_topics_build(paths: &Paths, args: TopicsBuildArgs) -> Result<()> {
+    let cfg = Config::load(paths)?;
+    if !paths.db_file().exists() {
+        bail!("no index yet. Run `wom init` then `wom index`.");
+    }
+    paths.ensure_data_dir()?;
+    let db = Db::open(&paths.db_file())?;
+
+    let model = db
+        .get_meta("model_id")?
+        .ok_or_else(|| anyhow!("the index has no recorded model; run `wom index` first"))?;
+    let dim = db
+        .get_meta("dim")?
+        .and_then(|v| v.parse::<usize>().ok())
+        .ok_or_else(|| anyhow!("the index has no recorded dimension; run `wom index` first"))?;
+    if cfg.model != model {
+        eprintln!(
+            "wom: note: config model is {}, the index was built with {model}; topics follow the index",
+            cfg.model
+        );
+    }
+    if db.count_embedded()? == 0 {
+        bail!("no embedded files; run `wom index` (without --no-embed) first");
+    }
+    if !paths.file_vectors().exists() {
+        bail!("the vector index is missing; run `wom index` first");
+    }
+
+    // A build reads the vector store end to end. The scan lock keeps a refresh
+    // from remapping it underneath us; a scan already running is a retry, not
+    // a corrupt read.
+    let _lock = index::ScanLock::acquire(&paths.scan_lock())
+        .map_err(|e| anyhow!("cannot build topics: {e}"))?;
+    let store = VectorStore::open(&paths.file_vectors(), dim, &model)?;
+    let roots: Vec<PathBuf> = cfg.roots.iter().map(|r| r.path.clone()).collect();
+    let opts = topics::BuildOptions {
+        k: args.k,
+        epochs: args.epochs,
+        sample: args.sample,
+        seed: args.seed,
+    };
+    let stats = topics::build(&db, &store, &model, &roots, &opts)?;
+
+    let elapsed = if stats.elapsed_secs < 1.0 {
+        format!("{:.2}s", stats.elapsed_secs)
+    } else {
+        human_duration(stats.elapsed_secs)
+    };
+    println!(
+        "built {} topics from {} files in {elapsed}",
+        stats.built_k, stats.assigned
+    );
+    if stats.requested_k != stats.built_k {
+        println!(
+            "  {} requested, {} non-empty (empty clusters are dropped)",
+            stats.requested_k, stats.built_k
+        );
+    }
+    println!(
+        "  sample {} · {} epochs · batch {} · alpha0 {:.3} · {} updates",
+        stats.sample, stats.epochs, stats.batch, stats.alpha0, stats.steps
+    );
+    println!(
+        "  variance explained {:.1}% · sizes {}–{} (median {})",
+        stats.variance_explained * 100.0,
+        stats.size_min,
+        stats.size_max,
+        stats.size_median
+    );
+    Ok(())
+}
+
+fn cmd_topics_list(paths: &Paths) -> Result<()> {
+    if !paths.db_file().exists() {
+        bail!("no index yet. Run `wom init` then `wom index`.");
+    }
+    let db = Db::open(&paths.db_file())?;
+    let state = topics::staleness(&db)?;
+    if !state.built {
+        println!("No topics yet. Run `wom topics build`.");
+        return Ok(());
+    }
+    let rows = topics::summaries(&db)?;
+
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!(
+            "{:>3}  {:>5}  {:<34}  EXAMPLE",
+            "ID", "FILES", "LABEL"
+        );
+        for t in &rows {
+            let example = if t.example_path.is_empty() {
+                String::new()
+            } else {
+                elide(&search::tilde(Path::new(&t.example_path)), 48)
+            };
+            println!("{:>3}  {:>5}  {:<34}  {}", t.id, t.files, t.label, example);
+        }
+        let built = match state.built_at {
+            Some(ts) => format!(
+                "built {} ago",
+                human_duration(age_secs(ts) as f64)
+            ),
+            None => "build time unknown".to_string(),
+        };
+        println!(
+            "\n{} topics · {} files · {built}",
+            state.topic_count, state.files
+        );
+    } else {
+        for t in &rows {
+            println!("{}\t{}\t{}", t.id, t.files, t.label);
+        }
+    }
+    if let Some(note) = topics::stale_note(&state) {
+        eprintln!("wom: {note}");
+    }
+    Ok(())
+}
+
+fn cmd_topics_show(paths: &Paths, args: TopicsShowArgs) -> Result<()> {
+    if !paths.db_file().exists() {
+        bail!("no index yet. Run `wom init` then `wom index`.");
+    }
+    let db = Db::open(&paths.db_file())?;
+    let state = topics::staleness(&db)?;
+    if !state.built {
+        bail!("no topics yet. Run `wom topics build` first.");
+    }
+    if let Some(note) = topics::stale_note(&state) {
+        eprintln!("wom: {note}");
+    }
+    let topic = topics::summary(&db, args.id)?
+        .ok_or_else(|| anyhow!("topic {} does not exist; run `wom topics`", args.id))?;
+
+    let req = search::Request {
+        text: String::new(),
+        scope: Vec::new(),
+        limit: args.limit,
+        mode: search::Mode::Hybrid,
+        min_similarity: 0.0,
+        topic: Some(args.id),
+    };
+    let results = search::topic_results(&db, args.id, args.limit)?;
+    if results.is_empty() {
+        println!("topic {} has no files", args.id);
+        return Ok(());
+    }
+
+    use std::io::IsTerminal;
+    let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    if interactive && !args.no_tui {
+        let mut app = tui::App::new(
+            paths,
+            &db,
+            None,
+            None,
+            &req,
+            results,
+            Some(topic.label),
+            Some(topic.files),
+        );
+        return tui::run(&mut app);
+    }
+    for result in &results {
+        println!("{}", result.display());
+    }
+    Ok(())
+}
+
+/// The `topics  ...` status line, with the remedy for each stale state.
+fn print_topics_line(db: &Db) {
+    let Ok(state) = topics::staleness(db) else {
+        println!("topics   unknown");
+        return;
+    };
+    if !state.built {
+        println!("topics   none (run `wom topics build`)");
+        return;
+    }
+    let built = match state.built_at {
+        Some(ts) => format!("built {} ago", human_duration(age_secs(ts) as f64)),
+        None => "build time unknown".to_string(),
+    };
+    let mut line = format!(
+        "topics   {} topics, {} files, {built}",
+        state.topic_count, state.files
+    );
+    if state.model_mismatch.is_some() {
+        line.push_str("  [model changed: run `wom topics build`]");
+    } else if state.added > 0 {
+        line.push_str(&format!("  [{} files added since]", state.added));
+    }
+    println!("{line}");
 }
 
 // ---------------------------------------------------------------- helpers

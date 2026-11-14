@@ -180,7 +180,7 @@ pub fn copy_to_clipboard(text: &str) -> Result<&'static str> {
 ///
 /// Uses `create_new` (O_CREAT|O_EXCL) so the no-clobber check is atomic: no
 /// TOCTOU window, and dangling symlinks fail instead of being followed.
-pub fn save_results(results: &[SearchResult], query: &str, path: &Path) -> Result<usize> {
+pub fn save_results(results: &[SearchResult], title: &str, path: &Path) -> Result<usize> {
     let s = path.to_string_lossy();
     if s.starts_with('~') {
         bail!("`~` is not expanded here; save to a plain filename or redirect output instead");
@@ -204,7 +204,7 @@ pub fn save_results(results: &[SearchResult], query: &str, path: &Path) -> Resul
         }
     }
     let mut out = String::new();
-    out.push_str(&format!("# wom results for: {query}\n"));
+    out.push_str(&format!("# wom results for: {title}\n"));
     out.push_str(&format!("# {} matches\n\n", results.len()));
     for r in results {
         out.push_str(&r.display());
@@ -274,6 +274,7 @@ mod tests {
             lexical_rank: None,
             rerank: None,
             file_count: None,
+            topic_distance: None,
         }
     }
 

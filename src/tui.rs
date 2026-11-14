@@ -51,6 +51,10 @@ pub struct App<'a> {
     saving: Option<String>,
     status: Option<(String, Instant, bool)>,
     show_scores: bool,
+    /// Display name of the topic being browsed, when this is a topic view.
+    topic_label: Option<String>,
+    /// Live size of that topic, when it is larger than the loaded result list.
+    topic_total: Option<i64>,
 }
 
 impl<'a> App<'a> {
@@ -61,6 +65,8 @@ impl<'a> App<'a> {
         reranker: Option<&'a dyn Reranker>,
         req: &Request,
         results: Vec<SearchResult>,
+        topic_label: Option<String>,
+        topic_total: Option<i64>,
     ) -> Self {
         let mut state = ListState::default();
         if !results.is_empty() {
@@ -78,6 +84,16 @@ impl<'a> App<'a> {
             saving: None,
             status: None,
             show_scores: false,
+            topic_label,
+            topic_total,
+        }
+    }
+
+    /// The title used when saving results: the query, or the topic being browsed.
+    fn title(&self) -> String {
+        match &self.topic_label {
+            Some(label) => format!("topic: {label}"),
+            None => self.req.text.clone(),
         }
     }
 
@@ -327,8 +343,8 @@ fn handle_save_key(app: &mut App, key: KeyEvent) -> Flow {
         KeyCode::Char(c) => name.push(c),
         KeyCode::Enter => {
             let path = PathBuf::from(name.clone());
-            let query = app.req.text.clone();
-            let res = actions::save_results(&app.results, &query, &path);
+            let title = app.title();
+            let res = actions::save_results(&app.results, &title, &path);
             app.saving = None;
             match res {
                 Ok(n) => app.note(format!("saved {n} results to {}", path.display())),
@@ -383,17 +399,36 @@ fn draw_query(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ));
     }
+    if let Some(label) = &app.topic_label {
+        spans.push(Span::styled(
+            format!("[topic: {label}] "),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
     spans.push(Span::raw(app.req.text.clone()));
+    if app.req.text.is_empty() && app.topic_label.is_some() && !app.editing {
+        spans.push(Span::styled(
+            "  (/ to filter this topic)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     if app.editing {
         spans.push(Span::styled(
             "\u{2588}",
             Style::default().fg(Color::Cyan),
         ));
     }
-    spans.push(Span::styled(
-        format!("   {} matches", app.results.len()),
-        Style::default().fg(Color::DarkGray),
-    ));
+    let count = match app.topic_total {
+        // Only the unfiltered topic list is truncated by the limit; a typed
+        // query produces matches, not a partial view of the topic.
+        Some(total)
+            if app.req.text.trim().is_empty() && total > app.results.len() as i64 =>
+        {
+            format!("   {} of {} files", app.results.len(), total)
+        }
+        _ => format!("   {} matches", app.results.len()),
+    };
+    spans.push(Span::styled(count, Style::default().fg(Color::DarkGray)));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -454,6 +489,8 @@ fn draw_results(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
 
     let title = if app.results.is_empty() {
         " no matches ".to_string()
+    } else if app.req.topic.is_some() {
+        " topic ".to_string()
     } else {
         " results ".to_string()
     };
@@ -478,18 +515,26 @@ fn draw_preview(f: &mut ratatui::Frame, app: &App, area: Rect) {
             if let Some(c) = r.cosine {
                 s.push_str(&format!("similarity  {c:.3}\n"));
             }
-            let arms = match (r.dense_rank, r.lexical_rank) {
-                (Some(d), Some(l)) => format!("matched by  meaning (#{d}) and text (#{l})"),
-                (Some(d), None) => format!("matched by  meaning (#{d})"),
-                (None, Some(l)) => format!("matched by  text (#{l})"),
-                (None, None) => "matched by  contents of this directory".to_string(),
-            };
-            s.push_str(&arms);
+            if let Some(distance) = r.topic_distance {
+                s.push_str(&format!("topic member  ·  distance {distance:.3}\n"));
+            } else {
+                let arms = match (r.dense_rank, r.lexical_rank) {
+                    (Some(d), Some(l)) => format!("matched by  meaning (#{d}) and text (#{l})"),
+                    (Some(d), None) => format!("matched by  meaning (#{d})"),
+                    (None, Some(l)) => format!("matched by  text (#{l})"),
+                    (None, None) => "matched by  contents of this directory".to_string(),
+                };
+                s.push_str(&arms);
+            }
             s.push_str("\n\n");
             match r.file_count {
                 Some(n) => s.push_str(&format!("directory holding {n} indexed files")),
                 None if r.snippet.is_empty() => {
-                    s.push_str("(no extracted text; matched on path and name)")
+                    if r.topic_distance.is_some() {
+                        s.push_str("(no extracted text; assigned from path and name)")
+                    } else {
+                        s.push_str("(no extracted text; matched on path and name)")
+                    }
                 }
                 None => s.push_str(&r.snippet),
             }

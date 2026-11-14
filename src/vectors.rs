@@ -213,20 +213,42 @@ impl VectorStore {
 
     /// Read a row back as floats. `None` if the row is empty or out of range.
     pub fn get(&self, row: usize) -> Option<Vec<f32>> {
+        let mut out = vec![0.0; self.dim];
+        match self.read_into(row, &mut out) {
+            Ok(true) => Some(out),
+            _ => None,
+        }
+    }
+
+    /// Dequantise `row` into `out`, returning whether the row held a live vector.
+    ///
+    /// The allocation-free form of [`Self::get`], for passes that walk every row
+    /// (clustering assignment, for example). `out` must be exactly `dim` long;
+    /// a dead or out-of-range row leaves it untouched and returns `false`.
+    pub fn read_into(&self, row: usize, out: &mut [f32]) -> Result<bool> {
+        if out.len() != self.dim {
+            bail!(
+                "row buffer has {} dims, store holds {}",
+                out.len(),
+                self.dim
+            );
+        }
         if row >= self.high_water {
-            return None;
+            return Ok(false);
         }
         let off = self.row_offset(row);
         let scale = read_f32(&self.map[off + self.dim..off + self.stride]);
         if scale == DEAD {
-            return None;
+            return Ok(false);
         }
-        Some(
-            self.map[off..off + self.dim]
-                .iter()
-                .map(|b| (*b as i8) as f32 * scale)
-                .collect(),
-        )
+        for (slot, byte) in out.iter_mut().zip(&self.map[off..off + self.dim]) {
+            *slot = (*byte as i8) as f32 * scale;
+        }
+        Ok(true)
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
     /// Top `k` rows by cosine similarity to `query`.
@@ -447,6 +469,28 @@ mod tests {
         let cos = cosine(&v, &got) / norm(&got);
         std::fs::remove_file(&p).ok();
         assert!(cos > 0.9999, "cosine after quantisation was {cos}");
+    }
+
+    #[test]
+    fn read_into_matches_get_and_reports_dead_rows() {
+        let p = tmp("read-into");
+        let mut s = VectorStore::open(&p, 4, "m").unwrap();
+        let v = unit(&[0.5, -0.25, 0.8, 0.1]);
+        s.put(0, &v).unwrap();
+
+        let mut buf = vec![0.0; 4];
+        assert!(s.read_into(0, &mut buf).unwrap());
+        assert_eq!(buf, s.get(0).unwrap());
+        assert_eq!(s.dim(), 4);
+
+        assert!(!s.read_into(100, &mut buf).unwrap(), "out of range");
+        s.put(2, &[0.0; 4]).unwrap();
+        assert!(!s.read_into(2, &mut buf).unwrap(), "dead row");
+        assert!(
+            s.read_into(0, &mut [0.0; 3]).is_err(),
+            "a buffer of the wrong length must be refused"
+        );
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

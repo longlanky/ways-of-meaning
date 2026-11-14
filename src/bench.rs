@@ -167,6 +167,7 @@ pub fn measure_recall(
             limit,
             mode: search::Mode::Hybrid,
             min_similarity: cfg.resolved_min_similarity(),
+            topic: None,
         };
         let t = Instant::now();
         let results = search::search(paths, db, Some(embedder), reranker, &req)?;

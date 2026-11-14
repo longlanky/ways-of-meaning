@@ -81,41 +81,48 @@ impl Db {
                 .context("creating database schema")?;
             self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
             self.set_meta("scan_gen", "0")?;
-            return Ok(());
+        } else {
+            // Catch a database whose tables do not match this binary even though
+            // the version number agrees — which happens whenever the schema is
+            // edited without a version bump. Without this, the mismatch surfaces
+            // much later as an opaque SQLite error like "no such column: T.name".
+            let fts_sql: String = self
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'files_fts'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            if fts_sql.contains("content=") {
+                anyhow::bail!(
+                    "this index was built with an incompatible full-text schema. \
+                     Run `wom index --rebuild` to discard and rebuild it."
+                );
+            }
+
+            let have: i64 = self
+                .get_meta("schema_version")?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if have != SCHEMA_VERSION {
+                // Everything here is a derived cache of the filesystem, so the
+                // honest migration for a schema bump is to rebuild rather than to
+                // carry forward migration code for an index nobody has yet.
+                anyhow::bail!(
+                    "index schema is version {have}, this build expects {SCHEMA_VERSION}. \
+                     Run `wom index --rebuild` to discard and rebuild the index."
+                );
+            }
         }
 
-        // Catch a database whose tables do not match this binary even though the
-        // version number agrees — which happens whenever the schema is edited
-        // without a version bump. Without this, the mismatch surfaces much later
-        // as an opaque SQLite error like "no such column: T.name".
-        let fts_sql: String = self
-            .conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE name = 'files_fts'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or_default();
-        if fts_sql.contains("content=") {
-            anyhow::bail!(
-                "this index was built with an incompatible full-text schema. \
-                 Run `wom index --rebuild` to discard and rebuild it."
-            );
-        }
-
-        let have: i64 = self
-            .get_meta("schema_version")?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        if have != SCHEMA_VERSION {
-            // Everything here is a derived cache of the filesystem, so the
-            // honest migration for a schema bump is to rebuild rather than to
-            // carry forward migration code for an index nobody has yet.
-            anyhow::bail!(
-                "index schema is version {have}, this build expects {SCHEMA_VERSION}. \
-                 Run `wom index --rebuild` to discard and rebuild the index."
-            );
-        }
+        // Topics are an optional derived cache layered on top of the index, so
+        // they are added without a schema-version bump: existing indexes keep
+        // working and gain the tables here. If a future change alters the core
+        // tables, bump SCHEMA_VERSION as usual.
+        self.conn
+            .execute_batch(TOPICS_SCHEMA)
+            .context("creating topics schema")?;
         Ok(())
     }
 
@@ -541,6 +548,28 @@ CREATE VIRTUAL TABLE dirs_fts USING fts5(
 );
 "#;
 
+/// Additive tables for `wom topics`. They are created on every open with
+/// `IF NOT EXISTS`, so an existing index gains them without a rebuild.
+///
+/// A topic's size is not stored: `file_topics` is the single source of truth,
+/// and files deleted by a scan cascade away from it. `example_path` is the
+/// nearest member at build time, kept for display.
+const TOPICS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS topics (
+  id           INTEGER PRIMARY KEY,
+  label        TEXT NOT NULL,
+  example_path TEXT NOT NULL DEFAULT '',
+  built_at     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_topics (
+  file_id  INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  topic_id INTEGER NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  distance REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS file_topics_topic ON file_topics(topic_id, distance);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +615,45 @@ mod tests {
             Some(SCHEMA_VERSION)
         );
         assert_eq!(db.count_files().unwrap(), 0);
+    }
+
+    #[test]
+    fn topics_tables_are_added_without_a_version_bump() {
+        let base = std::env::temp_dir().join(format!("wom-db-topics-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("index.db");
+
+        {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                db.get_meta_i64("schema_version").unwrap(),
+                Some(SCHEMA_VERSION)
+            );
+            db.conn
+                .execute_batch("DROP TABLE file_topics; DROP TABLE topics;")
+                .unwrap();
+        }
+        {
+            // Reopening an existing index must recreate the additive tables
+            // without touching the core schema version.
+            let db = Db::open(&path).unwrap();
+            let n: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name IN ('topics', 'file_topics')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 2, "topics tables were not recreated");
+            assert_eq!(
+                db.get_meta_i64("schema_version").unwrap(),
+                Some(SCHEMA_VERSION)
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

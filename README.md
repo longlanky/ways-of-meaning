@@ -63,6 +63,7 @@ wom notes --lexical                 # full-text only, no model load (~5 ms)
 wom notes --dense                   # vector similarity only
 wom notes --scores                  # show fused score and cosine
 wom notes --rerank                  # cross-encoder second opinion on the top results
+wom notes --topic 3                 # only files in topic 3 (see `wom topics`)
 ```
 
 A leading argument becomes a search scope only if it both exists as a directory
@@ -130,6 +131,43 @@ you took near Akureyri even though the files are named `IMG_1399.jpg`.
 
 Already-indexed photos are skipped by change detection, so enabling geo on an
 existing index takes one `wom index --force` to re-read them.
+
+## Topics
+
+`wom topics` turns the index into a browsable map of what it contains. It
+clusters the file vectors offline, labels each cluster from the paths and
+filenames of its members, and stores the result in SQLite. `build`, `list` and
+`show` never load the embedding model; a `--topic` search is an ordinary search
+and loads it as usual.
+
+```sh
+wom topics build          # once, after indexing
+wom topics                # id, size, label, example path
+wom topics show 3         # browse the files in topic 3
+wom tax forms --topic 3   # search within topic 3
+```
+
+```
+$ wom topics
+ ID  FILES  LABEL                     EXAMPLE
+  1   1204  employment · tax · w2     ~/Documents/Employment_Documents/...
+  2    842  bosnia · croatia · travel ~/Pictures/bosnia_croatia_trip_aug2024/...
+```
+
+`build` samples up to 100k vectors (`--sample` changes it), trains an
+[e-means](https://arxiv.org/abs/2611.09501) codebook, and assigns every embedded
+file to its nearest centroid. e-means reaches Lloyd's 25-epoch loss in a handful
+of passes, so a 274k-file index takes tens of seconds rather than minutes. The
+build reads only the vector store: it does not need the embedding model.
+
+Topics are a snapshot, not a live view. `wom status` shows their age and warns
+when files have been indexed since; `wom topics build` refreshes them. Changing
+the embedding model requires rebuilding the index and the topics.
+
+Labels are path and filename tokens scored by TF-IDF, with extensions, hex ids
+and common directory words removed. A topic is only as semantic as the text that
+was embedded: on a name-only media corpus it tends to group by name and folder.
+The default `k` is `sqrt(files)`, capped at 256.
 
 ## Measured on a real corpus
 

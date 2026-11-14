@@ -11,7 +11,7 @@ use crate::db::{Db, NO_VEC, prefix_range};
 use crate::embed::Embedder;
 use crate::rerank::Reranker;
 use crate::vectors::VectorStore;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -82,6 +82,9 @@ pub struct SearchResult {
     pub rerank: Option<f32>,
     /// For a directory result, how many indexed files it holds. `None` for files.
     pub file_count: Option<i64>,
+    /// Squared-L2 distance to the topic centroid, when this result came from a
+    /// topic view rather than a query. `None` for ordinary search results.
+    pub topic_distance: Option<f32>,
 }
 
 impl SearchResult {
@@ -106,6 +109,9 @@ pub struct Request {
     /// on a small corpus every file appears in the results regardless of
     /// relevance. The value is model-dependent, hence configurable.
     pub min_similarity: f32,
+    /// Restrict to one topic. Files only: directories are not assigned to
+    /// topics, and a topic filter suppresses the directory arms.
+    pub topic: Option<i64>,
 }
 
 /// Run a search.
@@ -117,7 +123,12 @@ pub fn search(
     req: &Request,
 ) -> Result<Vec<SearchResult>> {
     if req.text.trim().is_empty() {
-        return Ok(Vec::new());
+        // A topic view is useful with no query at all; `wom topics show` and
+        // the browser's initial load rely on it.
+        return match req.topic {
+            Some(topic) => topic_results(db, topic, req.limit),
+            None => Ok(Vec::new()),
+        };
     }
 
     // Five ranked lists, best first. Fusion cares only about position.
@@ -133,9 +144,11 @@ pub fn search(
                 file_dense.push((ResultKind::File, id));
                 cosines.insert((ResultKind::File, id), cos);
             }
-            for (id, cos) in dense_dirs(paths, db, e, &q, req)? {
-                dir_dense.push((ResultKind::Dir, id));
-                cosines.insert((ResultKind::Dir, id), cos);
+            if req.topic.is_none() {
+                for (id, cos) in dense_dirs(paths, db, e, &q, req)? {
+                    dir_dense.push((ResultKind::Dir, id));
+                    cosines.insert((ResultKind::Dir, id), cos);
+                }
             }
         }
     }
@@ -147,10 +160,12 @@ pub fn search(
             .into_iter()
             .map(|id| (ResultKind::File, id))
             .collect();
-        dir_lex = lexical_dirs(db, req)?
-            .into_iter()
-            .map(|id| (ResultKind::Dir, id))
-            .collect();
+        if req.topic.is_none() {
+            dir_lex = lexical_dirs(db, req)?
+                .into_iter()
+                .map(|id| (ResultKind::Dir, id))
+                .collect();
+        }
     }
 
     // Dense order first, then lexical-only hits, deduplicated via a set rather
@@ -162,22 +177,28 @@ pub fn search(
         .copied()
         .filter(|k| seen.insert(*k))
         .collect();
-    let dir_children = dirs_from_children(db, &best_files, CANDIDATES)?;
+    // A topic is a set of files; directories are not assigned to topics, so a
+    // topic filter is a files-only view.
+    let dir_children = if req.topic.is_some() {
+        Vec::new()
+    } else {
+        dirs_from_children(db, &best_files, CANDIDATES)?
+    };
 
-    // A directory inherits evidence from its matching children, at a lower weight
-    // than the direct arms: real signal, but weaker than the directory itself
-    // matching, and at full weight it would push containers above the specific
-    // file the user asked for.
-    let fused = fuse(&[
-        Arm::new(&file_dense),
-        Arm::new(&file_lex),
-        Arm { ranked: &dir_dense, weight: DIR_ARM_SCALE },
-        Arm { ranked: &dir_lex, weight: DIR_ARM_SCALE },
-        Arm {
+    let mut arms = vec![Arm::new(&file_dense), Arm::new(&file_lex)];
+    if req.topic.is_none() {
+        // A directory inherits evidence from its matching children, at a lower
+        // weight than the direct arms: real signal, but weaker than the directory
+        // itself matching, and at full weight it would push containers above the
+        // specific file the user asked for.
+        arms.push(Arm { ranked: &dir_dense, weight: DIR_ARM_SCALE });
+        arms.push(Arm { ranked: &dir_lex, weight: DIR_ARM_SCALE });
+        arms.push(Arm {
             ranked: &dir_children,
             weight: DIR_FROM_CHILDREN_WEIGHT * DIR_ARM_SCALE,
-        },
-    ]);
+        });
+    }
+    let fused = fuse(&arms);
 
     // A cross-encoder re-orders the top of the fused list — deeper than the
     // final limit so it has room to promote candidates, capped so a committed
@@ -244,6 +265,7 @@ pub fn search(
             lexical_rank: lex_pos.get(&key).copied(),
             rerank: rerank_scores.get(&key).copied(),
             file_count: m.file_count,
+            topic_distance: None,
         });
     }
     Ok(out)
@@ -432,13 +454,29 @@ fn dense_arm(
         return Ok(Vec::new());
     }
 
+    // Directories have no topic; the caller skips that arm. Files are filtered
+    // by the intersection of the scope and topic masks.
+    if kind == ResultKind::Dir && req.topic.is_some() {
+        return Ok(Vec::new());
+    }
     // Scope is applied as an allow-list over vector rows. Built only when a scope
     // was given, since it costs a query over the ids in range.
-    let allow = if req.scope.is_empty() {
+    let mut allow = if req.scope.is_empty() {
         None
     } else {
         Some(scope_allow_list(db, &req.scope, store.high_water(), kind)?)
     };
+    if let Some(topic) = req.topic {
+        let topic_mask = topic_allow_list(db, topic, store.high_water())?;
+        allow = Some(match allow {
+            Some(scope_mask) => scope_mask
+                .iter()
+                .zip(topic_mask)
+                .map(|(in_scope, in_topic)| *in_scope && in_topic)
+                .collect(),
+            None => topic_mask,
+        });
+    }
 
     let hits = store.search(q, CANDIDATES, allow.as_deref())?;
     // vec_row == the row id in its table, so a hit's row is already the id.
@@ -513,6 +551,59 @@ fn scope_allow_list(
     Ok(allow)
 }
 
+/// A per-row mask of files assigned to `topic`. Row ids are file ids, which is
+/// the invariant the vector store and every query in this module rely on.
+fn topic_allow_list(db: &Db, topic: i64, rows: usize) -> Result<Vec<bool>> {
+    let mut allow = vec![false; rows];
+    let mut st = db
+        .conn
+        .prepare("SELECT file_id FROM file_topics WHERE topic_id = ?1")?;
+    let ids = st.query_map(params![topic], |r| r.get::<_, i64>(0))?;
+    for id in ids {
+        let id = id?;
+        let row = id as usize;
+        if row >= rows {
+            bail!(
+                "topic {topic} references file {id}, which is outside the vector store. \
+                 Run `wom topics build`."
+            );
+        }
+        allow[row] = true;
+    }
+    Ok(allow)
+}
+
+/// Files in one topic, nearest first. Used by `wom topics show` and by a search
+/// with no query text but a topic selected.
+pub fn topic_results(db: &Db, topic: i64, limit: usize) -> Result<Vec<SearchResult>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut st = db.conn.prepare(
+        "SELECT f.id, f.path, f.snippet, ft.distance
+         FROM file_topics ft
+         JOIN files f ON f.id = ft.file_id
+         WHERE ft.topic_id = ?1
+         ORDER BY ft.distance, f.id
+         LIMIT ?2",
+    )?;
+    let rows = st.query_map(params![topic, limit as i64], |r| {
+        Ok(SearchResult {
+            kind: ResultKind::File,
+            path: PathBuf::from(r.get::<_, String>(1)?),
+            score: 0.0,
+            snippet: r.get(2)?,
+            dense_rank: None,
+            cosine: None,
+            lexical_rank: None,
+            rerank: None,
+            file_count: None,
+            topic_distance: Some(r.get::<_, f64>(3)? as f32),
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 /// SQL table backing each result kind.
 fn table_of(kind: ResultKind) -> &'static str {
     match kind {
@@ -535,12 +626,16 @@ fn dir_prefix_range(dir: &Path) -> (String, String) {
 fn lexical_files(db: &Db, req: &Request) -> Result<Vec<i64>> {
     // Column weights (path, name, body): a hit in the filename means far more
     // than one buried in the body.
-    lexical_arm(db, req, "files_fts", "files", "bm25(files_fts, 1.0, 3.0, 1.0)")
+    lexical_arm(db, req, "files_fts", "files", "bm25(files_fts, 1.0, 3.0, 1.0)", true)
 }
 
-/// Full-text hits over directory names.
+/// Full-text hits over directory names. A topic is a set of files, so this arm
+/// is absent under a topic filter.
 fn lexical_dirs(db: &Db, req: &Request) -> Result<Vec<i64>> {
-    lexical_arm(db, req, "dirs_fts", "dirs", "bm25(dirs_fts, 1.0, 3.0)")
+    if req.topic.is_some() {
+        return Ok(Vec::new());
+    }
+    lexical_arm(db, req, "dirs_fts", "dirs", "bm25(dirs_fts, 1.0, 3.0)", false)
 }
 
 fn lexical_arm(
@@ -549,6 +644,7 @@ fn lexical_arm(
     fts: &str,
     table: &str,
     rank: &str,
+    files: bool,
 ) -> Result<Vec<i64>> {
     let Some(match_expr) = fts_query(&req.text) else {
         return Ok(Vec::new());
@@ -560,36 +656,45 @@ fn lexical_arm(
     let mut sql = format!(
         "SELECT t.id FROM {fts} JOIN {table} t ON t.id = {fts}.rowid WHERE {fts} MATCH ?1"
     );
+    // Build the bind list and the placeholder numbers together. The previous
+    // hand-computed `2 + i * 3` indexing was correct but one added predicate
+    // away from silently binding to the wrong column.
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(match_expr)];
     if !req.scope.is_empty() {
         sql.push_str(" AND (");
-        for i in 0..req.scope.len() {
+        for (i, dir) in req.scope.iter().enumerate() {
             if i > 0 {
                 sql.push_str(" OR ");
             }
-            // Parameters start at 2; three per scope entry: subtree range plus
-            // the scope directory itself (parity with the dense allow-list, so
-            // a scoped search can return the directory it was scoped to).
-            // Harmless for files, which can never equal a directory path.
+            // Three parameters per scope entry: subtree range plus the scope
+            // directory itself (parity with the dense allow-list, so a scoped
+            // search can return the directory it was scoped to; harmless for
+            // files, which can never equal a directory path).
+            let first = binds.len() + 1;
             sql.push_str(&format!(
-                "(t.path >= ?{} AND t.path < ?{} OR t.path = ?{})",
-                2 + i * 3,
-                3 + i * 3,
-                4 + i * 3
+                "(t.path >= ?{first} AND t.path < ?{} OR t.path = ?{})",
+                first + 1,
+                first + 2
             ));
+            let (lo, hi) = dir_prefix_range(dir);
+            let bare = dir.to_string_lossy().trim_end_matches('/').to_string();
+            binds.push(Box::new(lo));
+            binds.push(Box::new(hi));
+            binds.push(Box::new(bare));
         }
         sql.push(')');
     }
-    sql.push_str(&format!(" ORDER BY {rank} LIMIT ?"));
-    sql.push_str(&(2 + req.scope.len() * 3).to_string());
-
-    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(match_expr)];
-    for dir in &req.scope {
-        let (lo, hi) = dir_prefix_range(dir);
-        let bare = dir.to_string_lossy().trim_end_matches('/').to_string();
-        binds.push(Box::new(lo));
-        binds.push(Box::new(hi));
-        binds.push(Box::new(bare));
+    if files {
+        if let Some(topic) = req.topic {
+            let next = binds.len() + 1;
+            sql.push_str(&format!(
+                " AND t.id IN (SELECT file_id FROM file_topics WHERE topic_id = ?{next})"
+            ));
+            binds.push(Box::new(topic));
+        }
     }
+    let next = binds.len() + 1;
+    sql.push_str(&format!(" ORDER BY {rank} LIMIT ?{next}"));
     binds.push(Box::new(CANDIDATES as i64));
 
     let mut st = db.conn.prepare(&sql)?;
@@ -932,6 +1037,7 @@ mod tests {
             lexical_rank: None,
             rerank: None,
             file_count: None,
+            topic_distance: None,
         };
         assert_eq!(d.display(), "directory:/h/employment_docs");
 
@@ -1018,7 +1124,109 @@ mod tests {
             limit: 10,
             mode: Mode::Hybrid,
             min_similarity: 0.0,
+            topic: None,
         }
+    }
+
+    fn insert_topic(db: &Db, id: i64, label: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO topics(id, label, example_path, built_at) VALUES (?1, ?2, '', 0)",
+                params![id, label],
+            )
+            .unwrap();
+    }
+
+    fn assign_topic(db: &Db, file: i64, topic: i64, distance: f64) {
+        db.conn
+            .execute(
+                "INSERT INTO file_topics(file_id, topic_id, distance) VALUES (?1, ?2, ?3)",
+                params![file, topic, distance],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn topic_results_are_nearest_first_and_respect_the_limit() {
+        let db = Db::open_in_memory().unwrap();
+        let a = insert_file(&db, "/t/a.txt", "alpha");
+        let b = insert_file(&db, "/t/b.txt", "beta");
+        let c = insert_file(&db, "/t/c.txt", "gamma");
+        insert_topic(&db, 1, "letters");
+        assign_topic(&db, a, 1, 0.3);
+        assign_topic(&db, b, 1, 0.1);
+        assign_topic(&db, c, 1, 0.2);
+
+        let all = topic_results(&db, 1, 10).unwrap();
+        let paths: Vec<String> = all
+            .iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, vec!["/t/b.txt", "/t/c.txt", "/t/a.txt"]);
+        assert!(all.iter().all(|r| r.topic_distance.is_some()));
+        assert!(all.iter().all(|r| r.kind == ResultKind::File));
+
+        let two = topic_results(&db, 1, 2).unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].path, PathBuf::from("/t/b.txt"));
+        assert!(topic_results(&db, 99, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lexical_search_can_be_restricted_to_a_topic() {
+        let db = Db::open_in_memory().unwrap();
+        let a = insert_file(&db, "/t/tax_notes.txt", "earnings earnings");
+        let _b = insert_file(&db, "/t/other_notes.txt", "earnings");
+        insert_topic(&db, 1, "tax");
+        assign_topic(&db, a, 1, 0.1);
+
+        let req = Request {
+            mode: Mode::Lexical,
+            topic: Some(1),
+            ..hybrid_req("earnings")
+        };
+        let out = search(&Paths::for_test(), &db, None, None, &req).unwrap();
+        assert_eq!(out.len(), 1, "topic filter leaked: {out:?}");
+        assert_eq!(out[0].path, PathBuf::from("/t/tax_notes.txt"));
+    }
+
+    #[test]
+    fn scope_and_topic_compose_by_intersection() {
+        let db = Db::open_in_memory().unwrap();
+        let a = insert_file(&db, "/t/a/keep.txt", "earnings");
+        let b = insert_file(&db, "/t/b/drop.txt", "earnings");
+        insert_topic(&db, 1, "all");
+        assign_topic(&db, a, 1, 0.1);
+        assign_topic(&db, b, 1, 0.2);
+
+        let req = Request {
+            mode: Mode::Lexical,
+            scope: vec![PathBuf::from("/t/a")],
+            topic: Some(1),
+            ..hybrid_req("earnings")
+        };
+        let out = search(&Paths::for_test(), &db, None, None, &req).unwrap();
+        assert_eq!(out.len(), 1, "scope/topic intersection failed: {out:?}");
+        assert_eq!(out[0].path, PathBuf::from("/t/a/keep.txt"));
+    }
+
+    #[test]
+    fn empty_text_with_a_topic_returns_the_topic() {
+        let db = Db::open_in_memory().unwrap();
+        let a = insert_file(&db, "/t/a.txt", "anything");
+        insert_topic(&db, 1, "one");
+        assign_topic(&db, a, 1, 0.5);
+
+        let req = Request {
+            text: String::new(),
+            limit: 5,
+            topic: Some(1),
+            ..hybrid_req("")
+        };
+        let out = search(&Paths::for_test(), &db, None, None, &req).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, PathBuf::from("/t/a.txt"));
+        assert_eq!(out[0].topic_distance, Some(0.5));
     }
 
     #[test]

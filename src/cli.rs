@@ -39,6 +39,56 @@ pub enum Command {
     },
     /// Measure indexing throughput and retrieval quality.
     Bench(BenchArgs),
+    /// Browse the semantic topics built from the index.
+    Topics {
+        #[command(subcommand)]
+        action: Option<TopicsAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TopicsAction {
+    /// Cluster the indexed vectors and replace the stored topic model.
+    Build(TopicsBuildArgs),
+    /// List topics, largest first. This is also the default for `wom topics`.
+    List,
+    /// Show the files in one topic.
+    Show(TopicsShowArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TopicsBuildArgs {
+    /// Number of topics. Defaults to sqrt(files), capped at 256.
+    #[arg(long, value_parser = parse_k)]
+    pub k: Option<usize>,
+
+    /// Training passes over the sampled vectors.
+    #[arg(long, default_value_t = 5, value_parser = parse_epochs)]
+    pub epochs: u32,
+
+    /// Vectors sampled for training. Caps the training matrix at roughly
+    /// 4 bytes x sample x dimensions; the default is ~400 MB at 1024-d.
+    #[arg(long, default_value_t = 100_000, value_parser = parse_sample)]
+    pub sample: usize,
+
+    /// Seed for sampling, initialization, and cluster revival.
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+}
+
+#[derive(Debug, Args)]
+pub struct TopicsShowArgs {
+    /// Topic id, as printed by `wom topics`.
+    #[arg(value_parser = parse_topic_id)]
+    pub id: i64,
+
+    /// Maximum files to list.
+    #[arg(long, default_value_t = 200)]
+    pub limit: usize,
+
+    /// Print plain lines even when attached to a terminal.
+    #[arg(long)]
+    pub no_tui: bool,
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +141,10 @@ pub struct SearchArgs {
     /// Override the dense-similarity floor for this query.
     #[arg(long, value_name = "COSINE")]
     pub min_similarity: Option<f32>,
+
+    /// Restrict results to one topic (see `wom topics`).
+    #[arg(long = "topic", short = 't', value_name = "ID", value_parser = parse_topic_id)]
+    pub topic: Option<i64>,
 }
 
 #[derive(Debug, Args)]
@@ -184,7 +238,7 @@ impl Cli {
 }
 
 const SUBCOMMANDS: &[&str] = &[
-    "search", "init", "index", "status", "config", "model", "bench", "help",
+    "search", "init", "index", "status", "config", "model", "bench", "topics", "help",
 ];
 
 /// Flags that belong to `wom` itself rather than to a search.
@@ -251,6 +305,46 @@ fn looks_like_path(s: &str) -> bool {
     s.contains('/') || s == "~" || s == "." || s == ".."
 }
 
+fn parse_k(value: &str) -> std::result::Result<usize, String> {
+    let k: usize = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a whole number"))?;
+    if !(2..=1024).contains(&k) {
+        return Err(format!("k must be between 2 and 1024, got {k}"));
+    }
+    Ok(k)
+}
+
+fn parse_epochs(value: &str) -> std::result::Result<u32, String> {
+    let epochs: u32 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a whole number"))?;
+    if !(1..=20).contains(&epochs) {
+        return Err(format!("epochs must be between 1 and 20, got {epochs}"));
+    }
+    Ok(epochs)
+}
+
+fn parse_sample(value: &str) -> std::result::Result<usize, String> {
+    let sample: usize = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a whole number"))?;
+    if sample < 2 {
+        return Err("sample must be at least 2".to_string());
+    }
+    Ok(sample)
+}
+
+fn parse_topic_id(value: &str) -> std::result::Result<i64, String> {
+    let id: i64 = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a topic id"))?;
+    if id < 1 {
+        return Err(format!("topic ids start at 1, got {id}"));
+    }
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,7 +357,7 @@ mod tests {
 
     #[test]
     fn explicit_subcommands_are_left_alone() {
-        for sub in ["init", "index", "status", "model", "bench"] {
+        for sub in ["init", "index", "status", "model", "bench", "topics"] {
             let got = insert_implicit_search(vec!["wom".into(), sub.into()]);
             assert_eq!(got, vec!["wom", sub], "subcommand {sub} was rewritten");
         }
@@ -331,6 +425,53 @@ mod tests {
                 assert_eq!(a.to_query().unwrap().text, "employment documents")
             }
             other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topics_is_a_subcommand_not_a_search_word() {
+        let got = insert_implicit_search(vec!["wom".into(), "topics".into()]);
+        assert_eq!(got, vec!["wom", "topics"]);
+        let got = insert_implicit_search(vec![
+            "wom".into(),
+            "topics".into(),
+            "build".into(),
+            "--k".into(),
+            "8".into(),
+        ]);
+        assert_eq!(got[1], "topics");
+        let cli = Cli::parse_from(got);
+        match cli.command {
+            Command::Topics {
+                action: Some(TopicsAction::Build(args)),
+            } => assert_eq!(args.k, Some(8)),
+            other => panic!("expected topics build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_topic_flag_parses_on_a_search() {
+        let cli = Cli::parse_from(insert_implicit_search(vec![
+            "wom".into(),
+            "-t".into(),
+            "3".into(),
+            "tax".into(),
+        ]));
+        match cli.command {
+            Command::Search(args) => {
+                assert_eq!(args.topic, Some(3));
+                assert_eq!(args.to_query().unwrap().text, "tax");
+            }
+            other => panic!("expected search, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_topics_parses_to_the_list_action() {
+        let cli = Cli::parse_from(vec!["wom", "topics"]);
+        match cli.command {
+            Command::Topics { action: None } => {}
+            other => panic!("expected topics list, got {other:?}"),
         }
     }
 
